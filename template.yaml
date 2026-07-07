@@ -1,0 +1,680 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Aviatrix Cloud Cleanup — API + Web app + Cookie auth
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Environment:
+      Variables:
+        CLEANUP_TABLE: !Ref CleanupJobsTable
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+  AzureSpSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Secrets Manager secret holding the Azure service principal as JSON
+      {tenantId, clientId, clientSecret, subscriptionId}. Leave blank to disable Azure cleanup.
+  GcpSaSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Secrets Manager secret holding the GCP service account key JSON.
+      Leave blank to disable GCP cleanup.
+  AzureSdkLayerArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of your own pre-built Azure SDK Lambda layer (see docs/AZURE_LAYER.md
+      for how to build one — it's pinned rather than built by this template
+      because it sits close to the 250 MB Lambda layer limit). Leave blank to
+      disable Azure cleanup/instances support.
+  LoginPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: >
+      Passphrase users type at /login.html. Min 12 chars. Pass via
+      --parameter-overrides on first deploy. CFN keeps it across deploys.
+  AuthSigningKey:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: >
+      HMAC signing key for auth cookies. Generate with
+      `openssl rand -hex 32`. Pass via --parameter-overrides on first deploy.
+
+# ── Conditions ────────────────────────────────────────────────────────────────
+Conditions:
+  HasAzureSecret: !Not [!Equals [!Ref AzureSpSecretArn, ""]]
+  HasGcpSecret:   !Not [!Equals [!Ref GcpSaSecretArn,   ""]]
+  HasAzureLayer:  !Not [!Equals [!Ref AzureSdkLayerArn, ""]]
+
+# ══════════════════════════════════════════════════════════════════════════════
+Resources:
+# ══════════════════════════════════════════════════════════════════════════════
+
+  # ── DynamoDB — job status store ─────────────────────────────────────────────
+  CleanupJobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: aviatrix-cleanup-jobs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ── DynamoDB — daily-stop schedule (single-row) ─────────────────────────────
+  ScheduleTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: aviatrix-cleanup-schedule
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # ── IAM — EventBridge Scheduler invokes the stop runner ─────────────────────
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-stop-runner
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt StopRunnerFunction.Arn
+
+  # ── Stop-runner Lambda — fired by EventBridge Scheduler ─────────────────────
+  StopRunnerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aviatrix-cleanup-stop-runner
+      Handler: schedule_runner.handler
+      CodeUri: lambda/
+      MemorySize: 256
+      Timeout: 120
+      Environment:
+        Variables:
+          SCHEDULE_TABLE:      !Ref ScheduleTable
+          AZURE_SP_SECRET_ARN: !Ref AzureSpSecretArn
+          GCP_SA_SECRET_ARN:   !Ref GcpSaSecretArn
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ScheduleTable
+        - !If
+          - HasAzureSecret
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AzureSpSecretArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasGcpSecret
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GcpSaSecretArn
+          - !Ref AWS::NoValue
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeRegions
+                - ec2:StopInstances
+              Resource: "*"
+
+  # ── HTTP API ────────────────────────────────────────────────────────────────
+  CleanupApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowCredentials: false
+      Auth:
+        DefaultAuthorizer: CookieAuthorizer
+        Authorizers:
+          CookieAuthorizer:
+            AuthorizerPayloadFormatVersion: '2.0'
+            EnableSimpleResponses: true
+            FunctionArn: !GetAtt AuthAuthorizerFunction.Arn
+            Identity:
+              Headers:
+                - Cookie
+            AuthorizerResultTtlInSeconds: 0
+
+  # ── Login / Logout Lambda — open routes (no auth) ──────────────────────────
+  LoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aviatrix-cleanup-login
+      Handler: auth_login.handler
+      CodeUri: lambda/
+      MemorySize: 128
+      Timeout: 5
+      Environment:
+        Variables:
+          LOGIN_PASSWORD:    !Ref LoginPassword
+          AUTH_SIGNING_KEY:  !Ref AuthSigningKey
+          SESSION_TTL_SECS:  "28800"
+      Events:
+        Login:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: POST
+            Path: /api/login
+            Auth:
+              Authorizer: NONE
+        Logout:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: POST
+            Path: /api/logout
+            Auth:
+              Authorizer: NONE
+
+  # ── Lambda Authorizer — verifies cm_auth HMAC cookie ───────────────────────
+  AuthAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aviatrix-cleanup-authorizer
+      Handler: auth_authorizer.handler
+      CodeUri: lambda/
+      MemorySize: 128
+      Timeout: 3
+      Environment:
+        Variables:
+          AUTH_SIGNING_KEY: !Ref AuthSigningKey
+
+  # SAM does not auto-create this when the authorizer is wired up via
+  # FunctionArn (rather than inline). Without it API Gateway gets AccessDenied
+  # invoking the authorizer and returns 500 Internal Server Error to clients.
+  AuthAuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthAuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CleanupApi}/authorizers/*"
+
+  # ── Routes Lambda — /api/cleanup*, /api/schedule*, /api/instances* ─────────
+  CleanupRoutesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aviatrix-cleanup-routes
+      Handler: cleanup_routes.handler
+      CodeUri: lambda/
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          CLEANUP_WORKER_ARN:  !GetAtt CleanupWorkerFunction.Arn
+          SCHEDULE_TABLE:      !Ref ScheduleTable
+          STOP_RUNNER_ARN:     !GetAtt StopRunnerFunction.Arn
+          SCHEDULER_ROLE_ARN:  !GetAtt SchedulerInvokeRole.Arn
+          AZURE_SP_SECRET_ARN: !Ref AzureSpSecretArn
+          GCP_SA_SECRET_ARN:   !Ref GcpSaSecretArn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CleanupJobsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ScheduleTable
+        - !If
+          - HasAzureSecret
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AzureSpSecretArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasGcpSecret
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GcpSaSecretArn
+          - !Ref AWS::NoValue
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt CleanupWorkerFunction.Arn
+            - Effect: Allow
+              Action:
+                - scheduler:CreateSchedule
+                - scheduler:UpdateSchedule
+                - scheduler:DeleteSchedule
+                - scheduler:GetSchedule
+              Resource: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/aviatrix-cleanup-stop-daily"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SchedulerInvokeRole.Arn
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeRegions
+                - ec2:DescribeInstanceStatus
+                - ec2:StartInstances
+                - ec2:StopInstances
+              Resource: "*"
+      Events:
+        StartCleanup:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: POST
+            Path: /api/cleanup
+            Auth:
+              Authorizer: CookieAuthorizer
+        GetStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: GET
+            Path: /api/cleanup/status
+            Auth:
+              Authorizer: CookieAuthorizer
+        GetSchedule:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: GET
+            Path: /api/schedule
+            Auth:
+              Authorizer: CookieAuthorizer
+        PutSchedule:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: PUT
+            Path: /api/schedule
+            Auth:
+              Authorizer: CookieAuthorizer
+        SkipSchedule:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: POST
+            Path: /api/schedule/skip
+            Auth:
+              Authorizer: CookieAuthorizer
+        UnskipSchedule:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: POST
+            Path: /api/schedule/unskip
+            Auth:
+              Authorizer: CookieAuthorizer
+        GetInstances:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: GET
+            Path: /api/instances
+            Auth:
+              Authorizer: CookieAuthorizer
+        StartInstance:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: POST
+            Path: /api/instances/start
+            Auth:
+              Authorizer: CookieAuthorizer
+        StopInstance:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: POST
+            Path: /api/instances/stop
+            Auth:
+              Authorizer: CookieAuthorizer
+        StartAllInstances:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: POST
+            Path: /api/instances/start-all
+            Auth:
+              Authorizer: CookieAuthorizer
+        StopAllInstances:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: POST
+            Path: /api/instances/stop-all
+            Auth:
+              Authorizer: CookieAuthorizer
+
+  # ── Worker Lambda — long-running cleanup (27 AWS / 26 Azure / 14 GCP steps) ─
+  # The Azure SDK layer is pinned via AzureSdkLayerArn — SAM never rebuilds it.
+  # google-auth for GCP is bundled in the function zip via lambda/requirements.txt.
+  CleanupWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aviatrix-cleanup-worker
+      Handler: cleanup_worker.handler
+      CodeUri: lambda/
+      MemorySize: 1024
+      Timeout: 900
+      Layers: !If [HasAzureLayer, [!Ref AzureSdkLayerArn], !Ref "AWS::NoValue"]
+      Environment:
+        Variables:
+          AZURE_SP_SECRET_ARN: !Ref AzureSpSecretArn
+          GCP_SA_SECRET_ARN:   !Ref GcpSaSecretArn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CleanupJobsTable
+        - !If
+          - HasAzureSecret
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AzureSpSecretArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasGcpSecret
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GcpSaSecretArn
+          - !Ref AWS::NoValue
+        - Statement:
+            - Effect: Allow
+              Action:
+                # ── EC2 / VPC ──────────────────────────────────────────────────
+                - ec2:Describe*
+                - ec2:DeleteTransitGatewayVpcAttachment
+                - ec2:DeleteTransitGateway
+                - ec2:DeleteInstanceConnectEndpoint
+                - ec2:DescribeInstanceConnectEndpoints
+                - ec2:DeleteVpc
+                - ec2:DeleteSubnet
+                - ec2:DeleteInternetGateway
+                - ec2:DetachInternetGateway
+                - ec2:DeleteRouteTable
+                - ec2:DeleteRoute
+                - ec2:DisassociateRouteTable
+                - ec2:DeleteNetworkAcl
+                - ec2:DeleteSecurityGroup
+                - ec2:RevokeSecurityGroupIngress
+                - ec2:RevokeSecurityGroupEgress
+                - ec2:DeleteNetworkInterface
+                - ec2:DetachNetworkInterface
+                - ec2:DeleteVpcEndpoints
+                - ec2:DeleteNatGateway
+                - ec2:ReleaseAddress
+                - ec2:TerminateInstances
+                - ec2:ModifyInstanceAttribute
+                - ec2:DeleteVolume
+                - ec2:DeleteSnapshot
+                - ec2:DeregisterImage
+                - ec2:DeleteKeyPair
+                # ── EKS ───────────────────────────────────────────────────────
+                - eks:ListClusters
+                - eks:DescribeCluster
+                - eks:ListNodegroups
+                - eks:DeleteNodegroup
+                - eks:ListFargateProfiles
+                - eks:DeleteFargateProfile
+                - eks:DeleteCluster
+                # ── Auto Scaling ──────────────────────────────────────────────
+                - autoscaling:DescribeAutoScalingGroups
+                - autoscaling:DeleteAutoScalingGroup
+                # ── RDS ───────────────────────────────────────────────────────
+                - rds:DescribeDBSubnetGroups
+                - rds:DescribeDBClusters
+                - rds:DescribeDBInstances
+                - rds:DeleteDBCluster
+                - rds:DeleteDBInstance
+                - rds:DeleteDBSubnetGroup
+                # ── ElastiCache ───────────────────────────────────────────────
+                - elasticache:DescribeCacheSubnetGroups
+                - elasticache:DescribeReplicationGroups
+                - elasticache:DescribeCacheClusters
+                - elasticache:DeleteReplicationGroup
+                - elasticache:DeleteCacheCluster
+                - elasticache:DeleteCacheSubnetGroup
+                # ── EFS ───────────────────────────────────────────────────────
+                - elasticfilesystem:DescribeFileSystems
+                - elasticfilesystem:DescribeMountTargets
+                - elasticfilesystem:DeleteMountTarget
+                - elasticfilesystem:DeleteFileSystem
+                # ── OpenSearch ────────────────────────────────────────────────
+                - es:ListDomainNames
+                - es:DescribeDomain
+                - es:DeleteDomain
+                - opensearch:ListDomainNames
+                - opensearch:DescribeDomain
+                - opensearch:DeleteDomain
+                # ── MSK (Kafka) ───────────────────────────────────────────────
+                - kafka:ListClustersV2
+                - kafka:DescribeClusterV2
+                - kafka:DeleteCluster
+                # ── Redshift ──────────────────────────────────────────────────
+                - redshift:DescribeClusters
+                - redshift:DeleteCluster
+                # ── ELB / ALB / NLB ──────────────────────────────────────────
+                - elasticloadbalancing:DescribeLoadBalancers
+                - elasticloadbalancing:DescribeListeners
+                - elasticloadbalancing:DescribeTargetGroups
+                - elasticloadbalancing:DeleteLoadBalancer
+                - elasticloadbalancing:DeleteListener
+                - elasticloadbalancing:DeleteTargetGroup
+                # ── ECR ───────────────────────────────────────────────────────
+                - ecr:DescribeRepositories
+                - ecr:DeleteRepository
+
+              Resource: "*"
+
+  # ── Web bucket — private; only CloudFront can read ─────────────────────────
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "aviatrix-cleanup-web-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── Origin Access Control — modern equivalent of OAI ────────────────────────
+  WebOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: aviatrix-cleanup-web-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ── CloudFront Function — gates static files; redirects to /login.html ─────
+  WebAuthFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: aviatrix-cleanup-auth-check
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Verify cm_auth HMAC; redirect to /login.html if missing/invalid
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub |
+        import crypto from 'crypto';
+
+        var SIGNING_KEY = '${AuthSigningKey}';
+
+        function handler(event) {
+            var request = event.request;
+            var uri = request.uri;
+
+            // Public paths: login page itself, login/logout API, static assets
+            // referenced from the login page (so the page can render before auth).
+            if (uri === '/login.html' ||
+                uri === '/app.css' ||
+                uri.indexOf('/api/login') === 0 ||
+                uri.indexOf('/api/logout') === 0) {
+                return request;
+            }
+
+            var auth = '';
+            if (request.cookies && request.cookies['cm_auth']) {
+                auth = request.cookies['cm_auth'].value;
+            }
+
+            if (!auth || !verify(auth)) {
+                return {
+                    statusCode: 302,
+                    statusDescription: 'Found',
+                    headers: {
+                        'location':      { value: '/login.html?returnTo=' + encodeURIComponent(uri) },
+                        'cache-control': { value: 'no-store' },
+                    },
+                };
+            }
+            return request;
+        }
+
+        function verify(token) {
+            var dot = token.indexOf('.');
+            if (dot < 1) return false;
+            var payloadB64 = token.substring(0, dot);
+            var sigB64     = token.substring(dot + 1);
+
+            var expected = crypto.createHmac('sha256', SIGNING_KEY)
+                .update(payloadB64)
+                .digest('base64')
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=+$/, '');
+
+            return expected === sigB64;
+        }
+
+  # ── CloudFront Distribution — single entry point ──────────────────────────
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        Comment: Aviatrix Cloud Cleanup web app
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt WebOAC.Id
+          - Id: ApiOrigin
+            DomainName: !Sub "${CleanupApi}.execute-api.${AWS::Region}.amazonaws.com"
+            OriginPath: !Sub "/${StageName}"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt WebAuthFunction.FunctionMetadata.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            # Managed-CachingDisabled
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # Managed-AllViewerExceptHostHeader (forwards Cookie etc.)
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # ── Bucket policy: allow only this CloudFront distribution to read ─────────
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${WebBucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+Outputs:
+# ══════════════════════════════════════════════════════════════════════════════
+
+  WebUrl:
+    Description: "Open this in a browser. Sign in with the LoginPassword."
+    Value: !Sub "https://${WebDistribution.DomainName}"
+
+  WebBucketName:
+    Description: "Run: aws s3 sync ./web/ s3://<this>/"
+    Value: !Ref WebBucket
+
+  CloudFrontDistributionId:
+    Description: "After uploading new files, invalidate cache: aws cloudfront create-invalidation --distribution-id <this> --paths '/*'"
+    Value: !Ref WebDistribution
+
+  CleanupApiUrl:
+    Description: "Internal — for direct API access via curl (still requires the auth cookie now)"
+    Value: !Sub "https://${CleanupApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+
+  RoutesLambdaArn:
+    Description: "Routes Lambda ARN"
+    Value: !GetAtt CleanupRoutesFunction.Arn
+
+  WorkerLambdaArn:
+    Description: "Worker Lambda ARN"
+    Value: !GetAtt CleanupWorkerFunction.Arn
+
+  DynamoTableName:
+    Description: "DynamoDB job table"
+    Value: !Ref CleanupJobsTable

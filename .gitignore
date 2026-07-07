@@ -1,0 +1,19 @@
+# Claude Code local settings (may contain pasted credentials in permission rules)
+.claude/
+
+# SAM build artifacts
+.aws-sam/
+
+# Deployment zips
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+
+# Local env / secrets
+.env
+samconfig.local.toml
+
+# OS
+.DS_Store

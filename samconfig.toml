@@ -1,0 +1,18 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "aviatrix-cleanup"
+region = "us-east-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+region          = "us-east-1"
+resolve_s3      = true
+capabilities    = "CAPABILITY_IAM"
+confirm_changeset = true
+s3_prefix = "aviatrix-cleanup"
+parameter_overrides = "StageName=\"prod\""
+image_repositories = []
