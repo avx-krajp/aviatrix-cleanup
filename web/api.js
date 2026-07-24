@@ -136,6 +136,7 @@ const API = {
         instanceType: item.instanceType || 'unknown',
         resourceGroup: item.resourceGroup || '',
         publicIp: item.publicIp || '',
+        linkUrl: item.linkUrl || '',
       }));
     } catch {
       return [];

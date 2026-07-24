@@ -147,7 +147,10 @@
               <span class="muted" style="margin-left: 8px" x-text="r.instanceType"></span>
             </div>
             <div class="muted" x-text="r.region"></div>
-            <div class="muted" x-show="r.publicIp" x-text="r.publicIp"></div>
+            <div class="muted" x-show="r.linkUrl">
+              <a :href="r.linkUrl" x-text="r.linkUrl" target="_blank" rel="noopener"></a>
+            </div>
+            <div class="muted" x-show="!r.linkUrl && r.publicIp" x-text="r.publicIp"></div>
             <div class="actions">
               <button class="action-start" :disabled="r.state !== 'stopped'" @click="startOne(r)">▶ Start</button>
               <button class="action-stop" :disabled="r.state !== 'running'" @click="stopOne(r)">⏹ Stop</button>

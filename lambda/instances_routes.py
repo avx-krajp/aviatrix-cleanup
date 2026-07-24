@@ -42,16 +42,45 @@ def _params(event: dict) -> dict:
 # AWS
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Aviatrix controller/copilot images — these get an https://<ip> link instead
+# of a plain IP in the instances list, since they're accessed via a web UI.
+AVX_AMI_PREFIXES = ("avx-controller-", "avx-copilot-")
+AVX_AZURE_SKU_PREFIXES = ("aviatrix-controller-", "avx-cplt-byol-")
+
+
+def _is_avx_ami(name: str) -> bool:
+    return any(name.startswith(p) for p in AVX_AMI_PREFIXES)
+
+
+def _is_avx_azure_sku(sku: str) -> bool:
+    return any(sku.startswith(p) for p in AVX_AZURE_SKU_PREFIXES)
+
+
 def _fetch_region_instances(region: str) -> list:
     client = boto3.client("ec2", region_name=region)
     response = client.describe_instances()
+    reservations = response["Reservations"]
+
+    image_ids = {
+        instance["ImageId"]
+        for reservation in reservations
+        for instance in reservation["Instances"]
+        if instance.get("ImageId")
+    }
+    ami_names = {}
+    if image_ids:
+        images = client.describe_images(ImageIds=list(image_ids)).get("Images", [])
+        ami_names = {img["ImageId"]: img.get("Name", "") for img in images}
+
     instances = []
-    for reservation in response["Reservations"]:
+    for reservation in reservations:
         for instance in reservation["Instances"]:
             name = next(
                 (t["Value"] for t in instance.get("Tags", []) if t["Key"] == "Name"),
                 instance["InstanceId"],
             )
+            ami = ami_names.get(instance.get("ImageId", ""), "")
+            public_ip = instance.get("PublicIpAddress", "")
             instances.append({
                 "id":           instance["InstanceId"],
                 "name":         name,
@@ -60,7 +89,9 @@ def _fetch_region_instances(region: str) -> list:
                 "region":       region,
                 "provider":     "AWS",
                 "type":         "EC2",
-                "publicIp":     instance.get("PublicIpAddress", ""),
+                "publicIp":     public_ip,
+                "ami":          ami,
+                "linkUrl":      f"https://{public_ip}" if public_ip and _is_avx_ami(ami) else "",
             })
     return instances
 
@@ -182,6 +213,36 @@ def _map_azure_state(power_state: str) -> str:
     }.get(power_state.lower(), "unknown")
 
 
+def _azure_vm_public_ip(vm: dict) -> str:
+    """Resolve a VM's first public IP via its NIC — a Network API round-trip
+    only worth paying for on the (rare) controller/copilot matches, not every
+    VM in the list."""
+    nics = vm.get("properties", {}).get("networkProfile", {}).get("networkInterfaces", [])
+    if not nics:
+        return ""
+    nic_id = nics[0].get("id", "")
+    if not nic_id:
+        return ""
+    nic_result, error = _azure_api_call(
+        f"https://management.azure.com{nic_id}?api-version=2023-05-01"
+    )
+    if error:
+        return ""
+    ip_configs = nic_result.get("properties", {}).get("ipConfigurations", [])
+    if not ip_configs:
+        return ""
+    pip_ref = ip_configs[0].get("properties", {}).get("publicIPAddress", {})
+    pip_id = pip_ref.get("id", "")
+    if not pip_id:
+        return ""
+    pip_result, error = _azure_api_call(
+        f"https://management.azure.com{pip_id}?api-version=2023-05-01"
+    )
+    if error:
+        return ""
+    return pip_result.get("properties", {}).get("ipAddress", "") or ""
+
+
 def get_azure_instances(event: dict) -> dict:
     region = _params(event).get("region")
     try:
@@ -214,6 +275,17 @@ def get_azure_instances(event: dict) -> dict:
                     power_state = code.replace("PowerState/", "")
                     break
 
+            sku = (
+                vm.get("plan", {}).get("name", "")
+                or vm.get("properties", {}).get("storageProfile", {})
+                       .get("imageReference", {}).get("sku", "")
+            )
+            link_url = ""
+            if _is_avx_azure_sku(sku):
+                public_ip = _azure_vm_public_ip(vm)
+                if public_ip:
+                    link_url = f"https://{public_ip}"
+
             vms.append({
                 "id":            vm_id,
                 "name":          vm.get("name", ""),
@@ -223,6 +295,8 @@ def get_azure_instances(event: dict) -> dict:
                 "resourceGroup": resource_group,
                 "provider":      "AZURE",
                 "type":          "VIRTUAL_MACHINE",
+                "sku":           sku,
+                "linkUrl":       link_url,
             })
         return _resp(200, {"status": "success", "count": len(vms), "instances": vms, "provider": "AZURE"})
     except Exception as exc:

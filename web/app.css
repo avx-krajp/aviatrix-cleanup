@@ -28,6 +28,8 @@ body {
 .container { max-width: 600px; margin: 0 auto; padding: 16px; }
 .center { text-align: center; }
 .muted { color: var(--muted); font-size: 13px; }
+.muted a { color: var(--primary); text-decoration: none; }
+.muted a:hover { text-decoration: underline; }
 
 .nav-bar {
   background: white;
