@@ -566,16 +566,17 @@ class AWSCleaner(BaseCleaner):
             sgs = self._paginated(self.ec2, "describe_security_groups", "SecurityGroups",
                 Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}])
             # clear all ingress/egress rules first (break cross-references)
-            for sg in sgs:
-                sgid = sg["GroupId"]
-                if sg["GroupName"] == "default":
-                    continue
-                if sg.get("IpPermissions"):
-                    self.ec2.revoke_security_group_ingress(
-                        GroupId=sgid, IpPermissions=sg["IpPermissions"])
-                if sg.get("IpPermissionsEgress"):
-                    self.ec2.revoke_security_group_egress(
-                        GroupId=sgid, IpPermissions=sg["IpPermissionsEgress"])
+            if not self.dry_run:
+                for sg in sgs:
+                    sgid = sg["GroupId"]
+                    if sg["GroupName"] == "default":
+                        continue
+                    if sg.get("IpPermissions"):
+                        self.ec2.revoke_security_group_ingress(
+                            GroupId=sgid, IpPermissions=sg["IpPermissions"])
+                    if sg.get("IpPermissionsEgress"):
+                        self.ec2.revoke_security_group_egress(
+                            GroupId=sgid, IpPermissions=sg["IpPermissionsEgress"])
             for sg in sgs:
                 if sg["GroupName"] == "default":
                     continue
@@ -615,10 +616,11 @@ class AWSCleaner(BaseCleaner):
                     continue
                 rtid = rt["RouteTableId"]
                 # disassociate subnets first
-                for assoc in rt.get("Associations", []):
-                    if not assoc.get("Main"):
-                        self.ec2.disassociate_route_table(
-                            AssociationId=assoc["RouteTableAssociationId"])
+                if not self.dry_run:
+                    for assoc in rt.get("Associations", []):
+                        if not assoc.get("Main"):
+                            self.ec2.disassociate_route_table(
+                                AssociationId=assoc["RouteTableAssociationId"])
                 details.append(self._delete(f"route-table {rtid}",
                     self.ec2.delete_route_table, RouteTableId=rtid))
         except Exception as exc:
@@ -649,8 +651,9 @@ class AWSCleaner(BaseCleaner):
             )["InternetGateways"]
             for igw in igws:
                 igwid = igw["InternetGatewayId"]
-                self.ec2.detach_internet_gateway(
-                    InternetGatewayId=igwid, VpcId=self.vpc_id)
+                if not self.dry_run:
+                    self.ec2.detach_internet_gateway(
+                        InternetGatewayId=igwid, VpcId=self.vpc_id)
                 details.append(self._delete(f"IGW {igwid}",
                     self.ec2.delete_internet_gateway, InternetGatewayId=igwid))
         except Exception as exc:
