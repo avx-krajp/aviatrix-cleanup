@@ -9,7 +9,7 @@ function app() {
 
     cleanupStep: 0,
     cloud: 'aws',
-    region: 'us-east-1',
+    region: 'all-regions',
     vpcId: '',
     dryRun: false,
     deleteText: '',
@@ -118,7 +118,7 @@ function app() {
       if (this.pollHandle) { clearInterval(this.pollHandle); this.pollHandle = null; }
       this.cleanupStep = 0;
       this.cloud = 'aws';
-      this.region = 'us-east-1';
+      this.region = 'all-regions';
       this.vpcId = '';
       this.dryRun = false;
       this.deleteText = '';
