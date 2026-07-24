@@ -544,7 +544,8 @@ Resources:
             // Public paths: login page itself, login/logout API, static assets
             // referenced from the login page (so the page can render before auth).
             if (uri === '/login.html' ||
-                uri === '/app.css' ||
+                uri === '/logo.svg' ||
+                uri.indexOf('/assets/') === 0 ||
                 uri.indexOf('/api/login') === 0 ||
                 uri.indexOf('/api/logout') === 0) {
                 return request;

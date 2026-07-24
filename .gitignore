@@ -4,6 +4,10 @@
 # SAM build artifacts
 .aws-sam/
 
+# Web app build artifacts
+web/node_modules/
+web/dist/
+
 # Deployment zips
 *.zip
 
