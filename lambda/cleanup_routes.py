@@ -196,10 +196,19 @@ def get_status(event: dict) -> dict:
     child_ids = item.get("childJobIds", [])
     if child_ids:
         children = []
-        for cid in child_ids:
-            cr = _table().get_item(Key={"jobId": cid}).get("Item")
-            if cr:
-                children.append(_decimal_fix(cr))
+        # batch_get_item caps at 100 keys per call — all-regions fan-out never
+        # exceeds that (largest is Azure's ~45 regions), but chunk defensively.
+        for i in range(0, len(child_ids), 100):
+            chunk = child_ids[i:i + 100]
+            resp = dynamodb.batch_get_item(RequestItems={
+                TABLE_NAME: {"Keys": [{"jobId": cid} for cid in chunk]}
+            })
+            children.extend(resp.get("Responses", {}).get(TABLE_NAME, []))
+        children = [_decimal_fix(c) for c in children]
+        # batch_get_item does not preserve key order — restore childJobIds order
+        # so the UI's per-region cards stay in a stable position across polls.
+        order = {cid: idx for idx, cid in enumerate(child_ids)}
+        children.sort(key=lambda c: order.get(c["jobId"], len(child_ids)))
 
         # Derive parent status from children.
         # Guard against empty children list (DDB eventual-consistency miss) —

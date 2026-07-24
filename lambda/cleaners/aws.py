@@ -46,6 +46,17 @@ class AWSCleaner(BaseCleaner):
         except Exception as exc:
             return f"error deleting {action_label}: {exc}"
 
+    def _paginated(self, client, op_name: str, result_key: str, **kwargs) -> list:
+        """Collect every page for a describe_* call. Several AWS calls default
+        to a single page (up to 1000 items) — an account with more of a given
+        resource type would otherwise silently see only the first page and
+        leave the rest orphaned with no error surfaced."""
+        paginator = client.get_paginator(op_name)
+        out = []
+        for page in paginator.paginate(**kwargs):
+            out.extend(page[result_key])
+        return out
+
     def _vpc_subnets(self) -> list[str]:
         r = self.ec2.describe_subnets(
             Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}]
@@ -444,9 +455,8 @@ class AWSCleaner(BaseCleaner):
                 for att in tgw_attachments:
                     details.append(f"[DRY-RUN] would delete: TGW attachment {att['TransitGatewayAttachmentId']}")
 
-            enis = self.ec2.describe_network_interfaces(
-                Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}]
-            )["NetworkInterfaces"]
+            enis = self._paginated(self.ec2, "describe_network_interfaces", "NetworkInterfaces",
+                Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}])
             for eni in enis:
                 eid = eni["NetworkInterfaceId"]
                 if eni["Status"] == "in-use":
@@ -553,9 +563,8 @@ class AWSCleaner(BaseCleaner):
         self._emit(17, "Security Groups", "running")
         details = []
         try:
-            sgs = self.ec2.describe_security_groups(
-                Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}]
-            )["SecurityGroups"]
+            sgs = self._paginated(self.ec2, "describe_security_groups", "SecurityGroups",
+                Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}])
             # clear all ingress/egress rules first (break cross-references)
             for sg in sgs:
                 sgid = sg["GroupId"]
@@ -598,9 +607,8 @@ class AWSCleaner(BaseCleaner):
         self._emit(19, "Route Tables", "running")
         details = []
         try:
-            rts = self.ec2.describe_route_tables(
-                Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}]
-            )["RouteTables"]
+            rts = self._paginated(self.ec2, "describe_route_tables", "RouteTables",
+                Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}])
             for rt in rts:
                 # skip main route table
                 if any(a.get("Main") for a in rt.get("Associations", [])):
@@ -663,7 +671,8 @@ class AWSCleaner(BaseCleaner):
         self._emit(23, "EBS Snapshots (owned by account)", "running")
         details = []
         try:
-            snaps = self.ec2.describe_snapshots(OwnerIds=["self"])["Snapshots"]
+            snaps = self._paginated(self.ec2, "describe_snapshots", "Snapshots",
+                OwnerIds=["self"])
             for s in snaps:
                 sid = s["SnapshotId"]
                 details.append(self._delete(f"snapshot {sid}",
@@ -676,7 +685,8 @@ class AWSCleaner(BaseCleaner):
         self._emit(24, "AMIs (owned by account)", "running")
         details = []
         try:
-            images = self.ec2.describe_images(Owners=["self"])["Images"]
+            images = self._paginated(self.ec2, "describe_images", "Images",
+                Owners=["self"])
             for img in images:
                 iid = img["ImageId"]
                 details.append(self._delete(f"AMI {iid}",

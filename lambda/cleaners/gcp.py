@@ -4,6 +4,7 @@ Uses google-auth + raw REST so no extra layer is needed.
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from .base import BaseCleaner
 
@@ -60,6 +61,17 @@ class GCPCleaner(BaseCleaner):
         except Exception as exc:
             self._dbg(f"  -> EXCEPTION: {exc}")
             return f"error deleting {label}: {exc}"
+
+    def _delete_urls_parallel(self, items: list) -> list[str]:
+        """Run _delete_url (delete + wait_op) for each (label, url) concurrently.
+        _delete_url blocks until its own operation completes, so looping over
+        many resources serially can add up to minutes; running them in a
+        thread pool bounds the total wait to the slowest one instead of the sum.
+        items: list of (label, url). Never raises."""
+        if not items:
+            return []
+        with ThreadPoolExecutor(max_workers=min(len(items), 10)) as ex:
+            return list(ex.map(lambda item: self._delete_url(*item), items))
 
     def _disable_deletion_protection(self, instance_url: str) -> str:
         try:
@@ -178,6 +190,7 @@ class GCPCleaner(BaseCleaner):
 
     def step2_instances(self, avx_nets: set):
         details = []
+        to_delete = []
         for iname, zone, net in self._aggregated_instances_raw():
             if iname == "_error":
                 details.append(f"error listing instances: {zone}")
@@ -189,11 +202,13 @@ class GCPCleaner(BaseCleaner):
                 self._dbg(f"  -> SKIP (not avx)")
                 continue
             url = f"{self.BASE}/projects/{self.project}/zones/{zone}/instances/{iname}"
-            details.append(self._delete_url(f"instance {iname} ({zone})", url))
+            to_delete.append((f"instance {iname} ({zone})", url))
+        details.extend(self._delete_urls_parallel(to_delete))
         self._finalize(2, "Compute Instances", details)
 
     def step3_disks(self, avx_nets: set):
         details = []
+        to_delete = []
         for dname, zone in self._aggregated_disks_raw():
             if dname == "_error":
                 details.append(f"error listing disks: {zone}")
@@ -201,7 +216,8 @@ class GCPCleaner(BaseCleaner):
             if not self._is_avx(dname):
                 continue
             url = f"{self.BASE}/projects/{self.project}/zones/{zone}/disks/{dname}"
-            details.append(self._delete_url(f"disk {dname} ({zone})", url))
+            to_delete.append((f"disk {dname} ({zone})", url))
+        details.extend(self._delete_urls_parallel(to_delete))
         self._finalize(3, "Persistent Disks", details)
 
     def step4_instance_groups(self, avx_nets: set):

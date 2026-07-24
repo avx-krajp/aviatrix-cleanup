@@ -3,6 +3,7 @@ azure.py — AzureCleaner (mirrors lib/azure_cleanup.sh — 22 per-RG steps + 4 
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .base import BaseCleaner
 
@@ -61,6 +62,39 @@ class AzureCleaner(BaseCleaner):
             return f"deleted: {action_label}"
         except Exception as exc:
             return f"error deleting {action_label}: {exc}"
+
+    def _az_delete_parallel(self, calls: list, _wait_timeout: int = 180) -> list[str]:
+        """Start every begin_delete call first, then wait on all the returned
+        LROPollers concurrently. Serializing N resources' delete-and-wait
+        (each can take minutes) into one loop risks exceeding the worker
+        Lambda's timeout; starting them all up front and waiting together
+        bounds the total wait to the slowest one instead of the sum.
+        calls: list of (label, fn, args, kwargs). Never raises."""
+        if self.dry_run:
+            return [f"[DRY-RUN] would delete: {label}" for label, *_ in calls]
+        if not calls:
+            return []
+
+        started = []  # (label, poller_or_exception)
+        for label, fn, args, kwargs in calls:
+            try:
+                started.append((label, fn(*args, **kwargs)))
+            except Exception as exc:
+                started.append((label, exc))
+
+        def _wait(item):
+            label, poller = item
+            if isinstance(poller, Exception):
+                return f"error deleting {label}: {poller}"
+            try:
+                if hasattr(poller, "result"):
+                    poller.result(timeout=_wait_timeout)
+                return f"deleted: {label}"
+            except Exception as exc:
+                return f"error deleting {label}: {exc}"
+
+        with ThreadPoolExecutor(max_workers=min(len(started), 10)) as ex:
+            return list(ex.map(_wait, started))
 
     def _az_fire_and_forget(self, action_label: str, fn, *args, **kwargs):
         """Initiate a delete but don't wait — used for RG deletion where the
@@ -143,15 +177,15 @@ class AzureCleaner(BaseCleaner):
         self._emit(3, f"VM Scale Sets ({rg})", "running")
         details = []
         try:
+            calls = []
             for v in self.compute.virtual_machine_scale_sets.list(rg):
                 if (v.provisioning_state or "").lower() == "deleting":
                     details.append(f"skipped: {v.name} already deleting")
                     continue
-                details.append(self._az_delete(
-                    f"VMSS {v.name}",
+                calls.append((f"VMSS {v.name}",
                     self.compute.virtual_machine_scale_sets.begin_delete,
-                    rg, v.name, force_deletion=True,
-                    _wait_timeout=600))
+                    (rg, v.name), {"force_deletion": True}))
+            details.extend(self._az_delete_parallel(calls, _wait_timeout=600))
             if details and not self.dry_run:
                 time.sleep(30)
         except Exception as exc:
@@ -162,12 +196,12 @@ class AzureCleaner(BaseCleaner):
         self._emit(4, f"Virtual Machines ({rg})", "running")
         details = []
         try:
-            for vm in self.compute.virtual_machines.list(rg):
-                details.append(self._az_delete(
-                    f"VM {vm.name}",
-                    self.compute.virtual_machines.begin_delete,
-                    rg, vm.name, force_deletion=True,
-                    _wait_timeout=600))
+            calls = [
+                (f"VM {vm.name}", self.compute.virtual_machines.begin_delete,
+                 (rg, vm.name), {"force_deletion": True})
+                for vm in self.compute.virtual_machines.list(rg)
+            ]
+            details.extend(self._az_delete_parallel(calls, _wait_timeout=600))
             if details and not self.dry_run:
                 time.sleep(20)
         except Exception as exc:
@@ -243,14 +277,14 @@ class AzureCleaner(BaseCleaner):
         self._emit(8, f"Redis Caches ({rg})", "running")
         details = []
         try:
+            calls = []
             for r in self.redis.redis.list_by_resource_group(rg):
                 if (r.provisioning_state or "").lower() == "deleting":
                     details.append(f"skipped: {r.name} already deleting")
                     continue
-                details.append(self._az_delete(
-                    f"Redis cache {r.name}",
-                    self.redis.redis.begin_delete, rg, r.name,
-                    _wait_timeout=600))
+                calls.append((f"Redis cache {r.name}",
+                    self.redis.redis.begin_delete, (rg, r.name), {}))
+            details.extend(self._az_delete_parallel(calls, _wait_timeout=600))
             if details and not self.dry_run:
                 time.sleep(30)
         except Exception as exc:
@@ -326,18 +360,21 @@ class AzureCleaner(BaseCleaner):
         self._emit(14, f"Load Balancers + App Gateways ({rg})", "running")
         details = []
         try:
-            for lb in self.network.load_balancers.list(rg):
-                details.append(self._az_delete(
-                    f"Load Balancer {lb.name}",
-                    self.network.load_balancers.begin_delete, rg, lb.name))
+            calls = [
+                (f"Load Balancer {lb.name}", self.network.load_balancers.begin_delete,
+                 (rg, lb.name), {})
+                for lb in self.network.load_balancers.list(rg)
+            ]
+            details.extend(self._az_delete_parallel(calls))
         except Exception as exc:
             details.append(f"error LBs: {exc}")
         try:
-            for ag in self.network.application_gateways.list(rg):
-                details.append(self._az_delete(
-                    f"Application Gateway {ag.name}",
-                    self.network.application_gateways.begin_delete, rg, ag.name,
-                    _wait_timeout=600))
+            calls = [
+                (f"Application Gateway {ag.name}", self.network.application_gateways.begin_delete,
+                 (rg, ag.name), {})
+                for ag in self.network.application_gateways.list(rg)
+            ]
+            details.extend(self._az_delete_parallel(calls, _wait_timeout=600))
         except Exception as exc:
             details.append(f"error AGWs: {exc}")
         self._finalize(14, f"Load Balancers + App Gateways ({rg})", details)
@@ -381,19 +418,26 @@ class AzureCleaner(BaseCleaner):
                 conns = list(self.network.virtual_network_gateway_connections.list(rg))
             except Exception:
                 conns = []
-            for gw in gateways:
-                # Delete connections referencing this gateway first
-                for conn in conns:
-                    g1 = getattr(conn, "virtual_network_gateway1", None)
-                    if g1 and (g1.id or "") == (gw.id or ""):
-                        details.append(self._az_delete(
-                            f"VPN connection {conn.name}",
-                            self.network.virtual_network_gateway_connections.begin_delete,
-                            rg, conn.name))
-                details.append(self._az_delete(
-                    f"VPN Gateway {gw.name}",
-                    self.network.virtual_network_gateways.begin_delete,
-                    rg, gw.name, _wait_timeout=900))
+            gw_ids = {(gw.id or "") for gw in gateways}
+            # Connections must go before their gateway, but connections for
+            # different gateways are independent — delete+wait all of them
+            # together first, then all gateways together.
+            conn_calls = [
+                (f"VPN connection {conn.name}",
+                 self.network.virtual_network_gateway_connections.begin_delete,
+                 (rg, conn.name), {})
+                for conn in conns
+                if getattr(conn, "virtual_network_gateway1", None)
+                and (conn.virtual_network_gateway1.id or "") in gw_ids
+            ]
+            details.extend(self._az_delete_parallel(conn_calls))
+
+            gw_calls = [
+                (f"VPN Gateway {gw.name}", self.network.virtual_network_gateways.begin_delete,
+                 (rg, gw.name), {})
+                for gw in gateways
+            ]
+            details.extend(self._az_delete_parallel(gw_calls, _wait_timeout=900))
             if gateways and not self.dry_run:
                 time.sleep(30)
         except Exception as exc:

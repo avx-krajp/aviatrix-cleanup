@@ -15,13 +15,18 @@ GCP_SA_SECRET_ARN   = os.environ.get("GCP_SA_SECRET_ARN", "")
 # Cached credentials, populated on first call
 _AZ_CRED_CACHE: tuple | None = None
 _GCP_CRED_CACHE: tuple | None = None  # (credentials, project_id)
+_AZ_SP_RAW_CACHE: dict | None = None
 
 
 def azure_sp_raw() -> dict:
     """Fetch the raw Azure SP secret JSON {tenantId, clientId, clientSecret,
     subscriptionId} without importing the azure-identity SDK. Used by
     instances_routes.py, which does its own lightweight OAuth via urllib
-    so it doesn't need the Azure SDK layer that only CleanupWorkerFunction has."""
+    so it doesn't need the Azure SDK layer that only CleanupWorkerFunction has.
+    Cached on the module, same as azure_credentials()/gcp_credentials()."""
+    global _AZ_SP_RAW_CACHE
+    if _AZ_SP_RAW_CACHE is not None:
+        return _AZ_SP_RAW_CACHE
     if not AZURE_SP_SECRET_ARN:
         raise RuntimeError(
             "AZURE_SP_SECRET_ARN env var is empty — Azure instances/cleanup is not "
@@ -29,7 +34,8 @@ def azure_sp_raw() -> dict:
         )
     sm = boto3.client("secretsmanager", region_name=REGION_ENV)
     raw = sm.get_secret_value(SecretId=AZURE_SP_SECRET_ARN)["SecretString"]
-    return json.loads(raw)
+    _AZ_SP_RAW_CACHE = json.loads(raw)
+    return _AZ_SP_RAW_CACHE
 
 
 def azure_credentials():

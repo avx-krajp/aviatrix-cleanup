@@ -188,7 +188,8 @@ def get_azure_instances(event: dict) -> dict:
         subscription_id = azure_sp_raw()["subscriptionId"]
         url = (
             f"https://management.azure.com/subscriptions/{subscription_id}"
-            f"/providers/Microsoft.Compute/virtualMachines?api-version=2023-03-01"
+            f"/providers/Microsoft.Compute/virtualMachines"
+            f"?api-version=2023-03-01&$expand=instanceView"
         )
         result, error = _azure_api_call(url)
         if error:
@@ -205,16 +206,13 @@ def get_azure_instances(event: dict) -> dict:
             if region and vm_location.lower() != region.lower():
                 continue
 
-            status_result, _err = _azure_api_call(
-                f"https://management.azure.com{vm_id}/instanceView?api-version=2023-03-01"
-            )
             power_state = "unknown"
-            if status_result:
-                for status in status_result.get("statuses", []):
-                    code = status.get("code", "")
-                    if code.startswith("PowerState/"):
-                        power_state = code.replace("PowerState/", "")
-                        break
+            instance_view = vm.get("properties", {}).get("instanceView", {})
+            for status in instance_view.get("statuses", []):
+                code = status.get("code", "")
+                if code.startswith("PowerState/"):
+                    power_state = code.replace("PowerState/", "")
+                    break
 
             vms.append({
                 "id":            vm_id,
