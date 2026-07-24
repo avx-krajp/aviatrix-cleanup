@@ -239,7 +239,7 @@ Resources:
       FunctionName: aviatrix-cleanup-routes
       Handler: cleanup_routes.handler
       CodeUri: lambda/
-      MemorySize: 128
+      MemorySize: 512
       Timeout: 30
       Environment:
         Variables:

@@ -15,6 +15,8 @@ import json
 import time
 import urllib.request
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import boto3
 
 from credentials import azure_sp_raw, gcp_credentials
@@ -103,11 +105,13 @@ def get_aws_instances(event: dict) -> dict:
             instances = _fetch_region_instances(region)
         else:
             instances = []
-            for r in ALL_AWS_REGIONS:
-                try:
-                    instances.extend(_fetch_region_instances(r))
-                except Exception:
-                    pass
+            with ThreadPoolExecutor(max_workers=len(ALL_AWS_REGIONS)) as ex:
+                futures = {ex.submit(_fetch_region_instances, r): r for r in ALL_AWS_REGIONS}
+                for future in as_completed(futures):
+                    try:
+                        instances.extend(future.result())
+                    except Exception:
+                        pass
         return _resp(200, {"status": "success", "count": len(instances), "instances": instances})
     except Exception as exc:
         return _resp(500, {"status": "error", "message": str(exc)})
