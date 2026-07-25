@@ -57,8 +57,13 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     brew install node
   fi
 
-  if ! command -v python3 >/dev/null 2>&1 || ! command -v pip3 >/dev/null 2>&1; then
-    warn "python3/pip3 not found — installing via Homebrew..."
+  if ! command -v python3.12 >/dev/null 2>&1; then
+    warn "python3.12 not found — installing via Homebrew (sam build needs this exact version to build the Lambda functions; template.yaml pins Runtime: python3.12)..."
+    brew install python@3.12
+  fi
+
+  if ! command -v pip3 >/dev/null 2>&1; then
+    warn "pip3 not found — installing via Homebrew..."
     brew install python3
   fi
 
@@ -70,7 +75,7 @@ else
   command -v aws >/dev/null 2>&1 || { err "AWS CLI not found. Install it first."; exit 1; }
   command -v sam >/dev/null 2>&1 || { err "AWS SAM CLI not found. Install it first."; exit 1; }
   command -v node >/dev/null 2>&1 || { err "Node.js not found. Install it first."; exit 1; }
-  command -v python3 >/dev/null 2>&1 || { err "python3 not found. Install it first."; exit 1; }
+  command -v python3.12 >/dev/null 2>&1 || { err "python3.12 not found (sam build needs this exact version — template.yaml pins Runtime: python3.12). Install it first."; exit 1; }
   command -v pip3 >/dev/null 2>&1 || { err "pip3 not found. Install it first."; exit 1; }
   command -v zip >/dev/null 2>&1 || { err "zip not found. Install it first."; exit 1; }
 fi
@@ -78,10 +83,10 @@ fi
 command -v aws >/dev/null 2>&1 || { err "AWS CLI install failed — install it manually and re-run."; exit 1; }
 command -v sam >/dev/null 2>&1 || { err "AWS SAM CLI install failed — install it manually and re-run."; exit 1; }
 command -v node >/dev/null 2>&1 || { err "Node.js install failed — install it manually and re-run."; exit 1; }
-command -v python3 >/dev/null 2>&1 || { err "python3 install failed — install it manually and re-run."; exit 1; }
+command -v python3.12 >/dev/null 2>&1 || { err "python3.12 install failed — install it manually (e.g. 'brew install python@3.12' or 'pyenv install 3.12' and put it on PATH) and re-run."; exit 1; }
 command -v pip3 >/dev/null 2>&1 || { err "pip3 install failed — install it manually and re-run."; exit 1; }
 command -v zip >/dev/null 2>&1 || { err "zip install failed — install it manually and re-run."; exit 1; }
-ok "aws, sam, node, python3 and zip found"
+ok "aws, sam, node, python3.12 and zip found"
 
 if ! aws sts get-caller-identity >/dev/null 2>&1; then
   err "AWS credentials are not configured or have expired."
