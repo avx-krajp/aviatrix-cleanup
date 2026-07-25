@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # =============================================================================
-# setup/deploy.sh — guided first-time deploy for Aviatrix Cloud Cleanup.
+# setup/deploy.sh — guided deploy for Aviatrix Cloud Cleanup.
 #
-# Auto-installs the AWS CLI and AWS SAM CLI on macOS (via Homebrew) if
-# missing, checks your AWS credentials, optionally creates the Azure/GCP
+# Auto-installs the AWS CLI, AWS SAM CLI and Node.js on macOS (via Homebrew)
+# if missing, checks your AWS credentials, optionally creates the Azure/GCP
 # Secrets Manager secrets, generates the auth signing key, prompts for a
-# login passphrase, then runs `sam build && sam deploy` with everything
-# wired up.
+# login passphrase, builds the web app, then runs `sam build && sam deploy`
+# with everything wired up.
 #
-# Safe to re-run — it detects an existing stack and skips the --guided
-# wizard on updates, reusing samconfig.toml and any resources that already
-# exist (secrets, etc).
+# Prompts for an optional deploy prefix: leave blank to deploy/update the
+# shared production stack "aviatrix-cleanup" (requires explicit confirmation),
+# or enter a name (e.g. your username) to deploy your own fully isolated
+# copy — separate CloudFormation stack, DynamoDB tables, Lambdas, S3 bucket,
+# CloudFront distribution, login passphrase and (optionally) Azure/GCP
+# secrets, saved to its own samconfig.<prefix>.toml (gitignored).
+#
+# Safe to re-run — it detects an existing stack (per prefix) and skips the
+# --guided wizard on updates, reusing that stack's saved config file and any
+# resources that already exist (secrets, etc).
 # =============================================================================
 set -euo pipefail
 
@@ -68,8 +75,32 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGION=$(aws configure get region 2>/dev/null || echo "us-east-1")
 ok "AWS credentials OK — account $ACCOUNT_ID, region $REGION"
 
-STACK_NAME="aviatrix-cleanup"
-if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
+# ── 1.5. Isolated deploy prefix ──────────────────────────────────────────────
+step "Deploy target"
+
+read -rp "Prefix for your own isolated deploy (letters/numbers/hyphens, e.g. your username), or leave blank for the shared production stack 'aviatrix-cleanup': " RAW_PREFIX
+
+if [ -z "$RAW_PREFIX" ]; then
+  warn "Blank prefix — this will deploy/update the LIVE PRODUCTION stack 'aviatrix-cleanup' used by others."
+  read -rp "Type 'yes' to confirm you want to deploy to the shared production stack: " CONFIRM_PROD
+  [ "$CONFIRM_PROD" = "yes" ] || { err "Aborted."; exit 1; }
+  PREFIX_SLUG=""
+  RESOURCE_PREFIX=""
+  STACK_NAME="aviatrix-cleanup"
+  CONFIG_FILE="samconfig.toml"
+else
+  PREFIX_SLUG=$(echo "$RAW_PREFIX" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]/-/g; s/-+/-/g; s/^-//; s/-$//' | cut -c1-20)
+  if [ -z "$PREFIX_SLUG" ]; then
+    err "Prefix sanitized to empty (only letters/numbers/hyphens allowed) — re-run and try again."
+    exit 1
+  fi
+  RESOURCE_PREFIX="${PREFIX_SLUG}-"
+  STACK_NAME="${PREFIX_SLUG}-aviatrix-cleanup"
+  CONFIG_FILE="samconfig.${PREFIX_SLUG}.toml"
+  ok "Isolated deploy — stack '$STACK_NAME', resources prefixed '${RESOURCE_PREFIX}'"
+fi
+
+if [ -f "$CONFIG_FILE" ] && aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
   FIRST_DEPLOY=false
   ok "Existing stack '$STACK_NAME' found in $REGION — this will update it."
 else
@@ -95,9 +126,10 @@ step "Azure cleanup + instances support (optional)"
 
 AZURE_SP_SECRET_ARN=""
 AZURE_SDK_LAYER_ARN=""
+AZURE_SECRET_NAME="${RESOURCE_PREFIX}aviatrix-cleanup/azure-sp"
 read -rp "Enable Azure support? [y/N] " enable_azure
 if [[ "$enable_azure" =~ ^[Yy]$ ]]; then
-  read -rp "  Already have a Secrets Manager ARN to reuse (e.g. a shared org secret)? Leave blank to create/update aviatrix-cleanup/azure-sp: " AZURE_SP_SECRET_ARN
+  read -rp "  Already have a Secrets Manager ARN to reuse (e.g. a shared org secret)? Leave blank to create/update $AZURE_SECRET_NAME: " AZURE_SP_SECRET_ARN
 
   if [ -z "$AZURE_SP_SECRET_ARN" ]; then
     read -rp "  Azure tenant ID: " AZ_TENANT_ID
@@ -108,12 +140,12 @@ if [[ "$enable_azure" =~ ^[Yy]$ ]]; then
     SECRET_JSON=$(printf '{"tenantId":"%s","clientId":"%s","clientSecret":"%s","subscriptionId":"%s"}' \
       "$AZ_TENANT_ID" "$AZ_CLIENT_ID" "$AZ_CLIENT_SECRET" "$AZ_SUB_ID")
 
-    if AZURE_SP_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id aviatrix-cleanup/azure-sp --query ARN --output text 2>/dev/null); then
-      warn "Secret aviatrix-cleanup/azure-sp already exists — updating it."
-      aws secretsmanager put-secret-value --secret-id aviatrix-cleanup/azure-sp --secret-string "$SECRET_JSON" >/dev/null
+    if AZURE_SP_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$AZURE_SECRET_NAME" --query ARN --output text 2>/dev/null); then
+      warn "Secret $AZURE_SECRET_NAME already exists — updating it."
+      aws secretsmanager put-secret-value --secret-id "$AZURE_SECRET_NAME" --secret-string "$SECRET_JSON" >/dev/null
     else
       AZURE_SP_SECRET_ARN=$(aws secretsmanager create-secret \
-        --name aviatrix-cleanup/azure-sp \
+        --name "$AZURE_SECRET_NAME" \
         --secret-string "$SECRET_JSON" \
         --query ARN --output text)
     fi
@@ -132,9 +164,10 @@ fi
 step "GCP cleanup + instances support (optional)"
 
 GCP_SA_SECRET_ARN=""
+GCP_SECRET_NAME="${RESOURCE_PREFIX}aviatrix-cleanup/gcp-sa"
 read -rp "Enable GCP support? [y/N] " enable_gcp
 if [[ "$enable_gcp" =~ ^[Yy]$ ]]; then
-  read -rp "  Already have a Secrets Manager ARN to reuse (e.g. a shared org secret)? Leave blank to create/update aviatrix-cleanup/gcp-sa: " GCP_SA_SECRET_ARN
+  read -rp "  Already have a Secrets Manager ARN to reuse (e.g. a shared org secret)? Leave blank to create/update $GCP_SECRET_NAME: " GCP_SA_SECRET_ARN
 
   if [ -z "$GCP_SA_SECRET_ARN" ]; then
     read -rp "  Path to your GCP service account key JSON file: " GCP_KEY_PATH
@@ -142,12 +175,12 @@ if [[ "$enable_gcp" =~ ^[Yy]$ ]]; then
       err "File not found: $GCP_KEY_PATH"
       exit 1
     fi
-    if GCP_SA_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id aviatrix-cleanup/gcp-sa --query ARN --output text 2>/dev/null); then
-      warn "Secret aviatrix-cleanup/gcp-sa already exists — updating it."
-      aws secretsmanager put-secret-value --secret-id aviatrix-cleanup/gcp-sa --secret-string "file://$GCP_KEY_PATH" >/dev/null
+    if GCP_SA_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$GCP_SECRET_NAME" --query ARN --output text 2>/dev/null); then
+      warn "Secret $GCP_SECRET_NAME already exists — updating it."
+      aws secretsmanager put-secret-value --secret-id "$GCP_SECRET_NAME" --secret-string "file://$GCP_KEY_PATH" >/dev/null
     else
       GCP_SA_SECRET_ARN=$(aws secretsmanager create-secret \
-        --name aviatrix-cleanup/gcp-sa \
+        --name "$GCP_SECRET_NAME" \
         --secret-string "file://$GCP_KEY_PATH" \
         --query ARN --output text)
     fi
@@ -164,18 +197,26 @@ sam build
 # ── 6. Deploy ─────────────────────────────────────────────────────────────────
 step "Deploying"
 
-OVERRIDES="StageName=prod LoginPassword=\"$LOGIN_PASSWORD\" AuthSigningKey=\"$AUTH_SIGNING_KEY\""
+OVERRIDES="StageName=prod ResourcePrefix=\"$RESOURCE_PREFIX\" LoginPassword=\"$LOGIN_PASSWORD\" AuthSigningKey=\"$AUTH_SIGNING_KEY\""
 [ -n "$AZURE_SP_SECRET_ARN" ] && OVERRIDES="$OVERRIDES AzureSpSecretArn=\"$AZURE_SP_SECRET_ARN\""
 [ -n "$AZURE_SDK_LAYER_ARN" ] && OVERRIDES="$OVERRIDES AzureSdkLayerArn=\"$AZURE_SDK_LAYER_ARN\""
 [ -n "$GCP_SA_SECRET_ARN" ]   && OVERRIDES="$OVERRIDES GcpSaSecretArn=\"$GCP_SA_SECRET_ARN\""
 
 if $FIRST_DEPLOY; then
-  # First deploy: run the full wizard once so stack name/region/capabilities
-  # get saved to samconfig.toml for every future run.
-  eval sam deploy --guided --region "$REGION" --parameter-overrides "$OVERRIDES"
+  # First deploy for this stack: run the full wizard once so stack
+  # name/region/capabilities get saved to its own config file for every
+  # future run. Stack name and config file are pre-filled — press Enter
+  # through the wizard's prompts to accept them.
+  ok "Guided deploy — stack name and config file are pre-filled, press Enter to accept."
+  eval sam deploy --guided --stack-name "$STACK_NAME" --config-file "$CONFIG_FILE" --region "$REGION" --parameter-overrides "$OVERRIDES"
 else
-  # Re-run: reuse the saved samconfig.toml settings, only override parameters.
-  eval sam deploy --region "$REGION" --parameter-overrides "$OVERRIDES"
+  # Re-run: reuse this stack's saved config file, only override parameters.
+  eval sam deploy --stack-name "$STACK_NAME" --config-file "$CONFIG_FILE" --region "$REGION" --parameter-overrides "$OVERRIDES"
+fi
+
+if ! aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
+  err "Stack '$STACK_NAME' not found after deploy — did you type a different name in the guided wizard? Re-run and accept the pre-filled stack name."
+  exit 1
 fi
 
 # ── 7. Build and upload the web app ─────────────────────────────────────────

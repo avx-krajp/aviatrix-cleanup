@@ -24,7 +24,7 @@ WORKER_ARN          = os.environ.get("CLEANUP_WORKER_ARN", "")
 SCHEDULE_TABLE_NAME = os.environ.get("SCHEDULE_TABLE", "aviatrix-cleanup-schedule")
 STOP_RUNNER_ARN     = os.environ.get("STOP_RUNNER_ARN", "")
 SCHEDULER_ROLE_ARN  = os.environ.get("SCHEDULER_ROLE_ARN", "")
-SCHEDULE_NAME       = "aviatrix-cleanup-stop-daily"
+SCHEDULE_NAME       = os.environ.get("SCHEDULE_NAME", "aviatrix-cleanup-stop-daily")
 SCHEDULE_KEY        = "default"
 IST_OFFSET_MIN      = 5 * 60 + 30
 IST                 = timezone(timedelta(minutes=IST_OFFSET_MIN))
