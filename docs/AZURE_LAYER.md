@@ -11,7 +11,16 @@ Azure cleaner and Azure instance routes will raise a clear error if
 invoked without `AzureSpSecretArn` configured, and everything else works
 normally.
 
-## Build it once
+## Automated (via `setup/deploy.sh`)
+
+If you enable Azure support in the guided deploy script, it builds and
+publishes this layer for you automatically (or reuses an existing one
+already published under this deploy's prefix) — no manual steps needed.
+Use the manual steps below only if you're deploying by hand (see
+`docs/DEPLOYMENT.md`) or the automated build fails (e.g. no network
+access to PyPI).
+
+## Build it manually
 
 ```bash
 cd layer/azure-sdk

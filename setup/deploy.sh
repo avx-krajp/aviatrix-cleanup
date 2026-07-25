@@ -4,9 +4,11 @@
 #
 # Auto-installs the AWS CLI, AWS SAM CLI and Node.js on macOS (via Homebrew)
 # if missing, checks your AWS credentials, optionally creates the Azure/GCP
-# Secrets Manager secrets, generates the auth signing key, prompts for a
-# login passphrase, builds the web app, then runs `sam build && sam deploy`
-# with everything wired up.
+# Secrets Manager secrets, auto-builds and publishes the Azure SDK Lambda
+# layer if Azure support is enabled (reusing an existing published version
+# if one is found), generates the auth signing key, prompts for a login
+# passphrase, builds the web app, then runs `sam build && sam deploy` with
+# everything wired up.
 #
 # Prompts for an optional deploy prefix: leave blank to deploy/update the
 # shared production stack "aviatrix-cleanup" (requires explicit confirmation),
@@ -55,16 +57,32 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     warn "Node.js not found — installing via Homebrew..."
     brew install node
   fi
+
+  if ! command -v python3 >/dev/null 2>&1 || ! command -v pip3 >/dev/null 2>&1; then
+    warn "python3/pip3 not found — installing via Homebrew..."
+    brew install python3
+  fi
+
+  if ! command -v zip >/dev/null 2>&1; then
+    warn "zip not found — installing via Homebrew..."
+    brew install zip
+  fi
 else
   command -v aws >/dev/null 2>&1 || { err "AWS CLI not found. Install it first."; exit 1; }
   command -v sam >/dev/null 2>&1 || { err "AWS SAM CLI not found. Install it first."; exit 1; }
   command -v node >/dev/null 2>&1 || { err "Node.js not found. Install it first."; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { err "python3 not found. Install it first."; exit 1; }
+  command -v pip3 >/dev/null 2>&1 || { err "pip3 not found. Install it first."; exit 1; }
+  command -v zip >/dev/null 2>&1 || { err "zip not found. Install it first."; exit 1; }
 fi
 
 command -v aws >/dev/null 2>&1 || { err "AWS CLI install failed — install it manually and re-run."; exit 1; }
 command -v sam >/dev/null 2>&1 || { err "AWS SAM CLI install failed — install it manually and re-run."; exit 1; }
 command -v node >/dev/null 2>&1 || { err "Node.js install failed — install it manually and re-run."; exit 1; }
-ok "aws, sam and node found"
+command -v python3 >/dev/null 2>&1 || { err "python3 install failed — install it manually and re-run."; exit 1; }
+command -v pip3 >/dev/null 2>&1 || { err "pip3 install failed — install it manually and re-run."; exit 1; }
+command -v zip >/dev/null 2>&1 || { err "zip install failed — install it manually and re-run."; exit 1; }
+ok "aws, sam, node, python3 and zip found"
 
 if ! aws sts get-caller-identity >/dev/null 2>&1; then
   err "AWS credentials are not configured or have expired."
@@ -78,10 +96,10 @@ ok "AWS credentials OK — account $ACCOUNT_ID, region $REGION"
 # ── 1.5. Isolated deploy prefix ──────────────────────────────────────────────
 step "Deploy target"
 
-read -rp "Prefix for your own isolated deploy (letters/numbers/hyphens, e.g. your username), or leave blank for the shared production stack 'aviatrix-cleanup': " RAW_PREFIX
+read -rp "Short name for your own isolated deploy (letters/numbers/hyphens only, e.g. your username 'livaraj' -> stack 'aviatrix-cleanup-livaraj'), or leave blank for the shared production stack 'aviatrix-cleanup': " RAW_PREFIX
 
 if [ -z "$RAW_PREFIX" ]; then
-  warn "Blank prefix — this will deploy/update the LIVE PRODUCTION stack 'aviatrix-cleanup' used by others."
+  warn "Blank name — this will deploy/update the LIVE PRODUCTION stack 'aviatrix-cleanup' used by others."
   read -rp "Type 'yes' to confirm you want to deploy to the shared production stack: " CONFIRM_PROD
   [ "$CONFIRM_PROD" = "yes" ] || { err "Aborted."; exit 1; }
   PREFIX_SLUG=""
@@ -91,13 +109,13 @@ if [ -z "$RAW_PREFIX" ]; then
 else
   PREFIX_SLUG=$(echo "$RAW_PREFIX" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]/-/g; s/-+/-/g; s/^-//; s/-$//' | cut -c1-20)
   if [ -z "$PREFIX_SLUG" ]; then
-    err "Prefix sanitized to empty (only letters/numbers/hyphens allowed) — re-run and try again."
+    err "Name sanitized to empty (only letters/numbers/hyphens allowed) — re-run and try again."
     exit 1
   fi
   RESOURCE_PREFIX="${PREFIX_SLUG}-"
-  STACK_NAME="${PREFIX_SLUG}-aviatrix-cleanup"
+  STACK_NAME="aviatrix-cleanup-${PREFIX_SLUG}"
   CONFIG_FILE="samconfig.${PREFIX_SLUG}.toml"
-  ok "Isolated deploy — stack '$STACK_NAME', resources prefixed '${RESOURCE_PREFIX}'"
+  ok "Isolated deploy — stack '$STACK_NAME' (underlying resources prefixed '${RESOURCE_PREFIX}', e.g. '${RESOURCE_PREFIX}aviatrix-cleanup-jobs')"
 fi
 
 if [ -f "$CONFIG_FILE" ] && aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
@@ -152,9 +170,30 @@ if [[ "$enable_azure" =~ ^[Yy]$ ]]; then
   fi
   ok "Azure secret ready: $AZURE_SP_SECRET_ARN"
 
-  read -rp "  Azure SDK Lambda layer ARN (see docs/AZURE_LAYER.md if you don't have one yet, or leave blank to skip Azure for now): " AZURE_SDK_LAYER_ARN
-  if [ -z "$AZURE_SDK_LAYER_ARN" ]; then
-    warn "No layer ARN provided — Azure cleanup/instances will error until you build one and redeploy with AzureSdkLayerArn set."
+  AZURE_LAYER_NAME="${RESOURCE_PREFIX}aviatrix-cleanup-azure-sdk"
+  echo "  Looking for an existing Azure SDK Lambda layer '$AZURE_LAYER_NAME' in this account..."
+  if AZURE_SDK_LAYER_ARN=$(aws lambda list-layer-versions --layer-name "$AZURE_LAYER_NAME" \
+      --region "$REGION" --query "LayerVersions[0].LayerVersionArn" --output text 2>/dev/null) \
+      && [ -n "$AZURE_SDK_LAYER_ARN" ] && [ "$AZURE_SDK_LAYER_ARN" != "None" ]; then
+    ok "Reusing existing layer: $AZURE_SDK_LAYER_ARN"
+  else
+    echo "  None found — building the Azure SDK layer now (this can take a few minutes)..."
+    LAYER_BUILD_DIR=$(mktemp -d)
+    if pip3 install -r layer/azure-sdk/requirements.txt -t "$LAYER_BUILD_DIR/python" \
+        --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 >/dev/null 2>&1 \
+      && (cd "$LAYER_BUILD_DIR" && zip -rq azure-sdk-layer.zip python/) \
+      && AZURE_SDK_LAYER_ARN=$(aws lambda publish-layer-version \
+           --layer-name "$AZURE_LAYER_NAME" \
+           --zip-file "fileb://$LAYER_BUILD_DIR/azure-sdk-layer.zip" \
+           --compatible-runtimes python3.12 \
+           --region "$REGION" \
+           --query LayerVersionArn --output text); then
+      ok "Azure SDK layer published: $AZURE_SDK_LAYER_ARN"
+    else
+      AZURE_SDK_LAYER_ARN=""
+      warn "Automated layer build failed — see docs/AZURE_LAYER.md to build it manually and redeploy with AzureSdkLayerArn set. Continuing without Azure support for now."
+    fi
+    rm -rf "$LAYER_BUILD_DIR"
   fi
 else
   ok "Skipping Azure — AzureSpSecretArn left blank"
