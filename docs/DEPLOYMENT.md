@@ -115,3 +115,13 @@ won't delete a non-empty bucket:
 ```bash
 aws s3 rm s3://<prefix>-aviatrix-cleanup-web-<account-id>/ --recursive
 ```
+
+If Azure support was enabled, `setup/deploy.sh` also creates a small S3
+bucket (`<prefix>aviatrix-cleanup-layer-staging-<account-id>`) to stage the
+Azure SDK layer zip during publish — also not a stack resource, so it
+survives `sam delete` too. Delete it once you no longer need to
+redeploy/update the Azure layer:
+
+```bash
+aws s3 rb s3://<prefix>aviatrix-cleanup-layer-staging-<account-id> --force
+```

@@ -10,12 +10,11 @@
 # passphrase, builds the web app, then runs `sam build && sam deploy` with
 # everything wired up.
 #
-# Prompts for an optional deploy prefix: leave blank to deploy/update the
-# shared production stack "aviatrix-cleanup" (requires explicit confirmation),
-# or enter a name (e.g. your username) to deploy your own fully isolated
-# copy — separate CloudFormation stack, DynamoDB tables, Lambdas, S3 bucket,
+# Requires a username (e.g. yours) to deploy your own fully isolated copy —
+# separate CloudFormation stack, DynamoDB tables, Lambdas, S3 bucket,
 # CloudFront distribution, login passphrase and (optionally) Azure/GCP
-# secrets, saved to its own samconfig.<prefix>.toml (gitignored).
+# secrets, saved to its own samconfig.<username>.toml (gitignored). There is
+# no shared/blank stack option — every deploy is isolated.
 #
 # Safe to re-run — it detects an existing stack (per prefix) and skips the
 # --guided wizard on updates, reusing that stack's saved config file and any
@@ -93,30 +92,20 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGION=$(aws configure get region 2>/dev/null || echo "us-east-1")
 ok "AWS credentials OK — account $ACCOUNT_ID, region $REGION"
 
-# ── 1.5. Isolated deploy prefix ──────────────────────────────────────────────
+# ── 1.5. Isolated deploy username ────────────────────────────────────────────
 step "Deploy target"
 
-read -rp "Short name for your own isolated deploy (letters/numbers/hyphens only, e.g. your username 'livaraj' -> stack 'aviatrix-cleanup-livaraj'), or leave blank for the shared production stack 'aviatrix-cleanup': " RAW_PREFIX
-
-if [ -z "$RAW_PREFIX" ]; then
-  warn "Blank name — this will deploy/update the LIVE PRODUCTION stack 'aviatrix-cleanup' used by others."
-  read -rp "Type 'yes' to confirm you want to deploy to the shared production stack: " CONFIRM_PROD
-  [ "$CONFIRM_PROD" = "yes" ] || { err "Aborted."; exit 1; }
-  PREFIX_SLUG=""
-  RESOURCE_PREFIX=""
-  STACK_NAME="aviatrix-cleanup"
-  CONFIG_FILE="samconfig.toml"
-else
+PREFIX_SLUG=""
+while [ -z "$PREFIX_SLUG" ]; do
+  read -rp "Enter your username (letters/numbers/hyphens only, e.g. 'livaraj' -> stack 'aviatrix-cleanup-livaraj'): " RAW_PREFIX
   PREFIX_SLUG=$(echo "$RAW_PREFIX" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]/-/g; s/-+/-/g; s/^-//; s/-$//' | cut -c1-20)
-  if [ -z "$PREFIX_SLUG" ]; then
-    err "Name sanitized to empty (only letters/numbers/hyphens allowed) — re-run and try again."
-    exit 1
-  fi
-  RESOURCE_PREFIX="${PREFIX_SLUG}-"
-  STACK_NAME="aviatrix-cleanup-${PREFIX_SLUG}"
-  CONFIG_FILE="samconfig.${PREFIX_SLUG}.toml"
-  ok "Isolated deploy — stack '$STACK_NAME' (underlying resources prefixed '${RESOURCE_PREFIX}', e.g. '${RESOURCE_PREFIX}aviatrix-cleanup-jobs')"
-fi
+  [ -z "$PREFIX_SLUG" ] && err "Username is required. Please enter a value."
+done
+
+RESOURCE_PREFIX="${PREFIX_SLUG}-"
+STACK_NAME="aviatrix-cleanup-${PREFIX_SLUG}"
+CONFIG_FILE="samconfig.${PREFIX_SLUG}.toml"
+ok "Isolated deploy — stack '$STACK_NAME' (underlying resources prefixed '${RESOURCE_PREFIX}', e.g. '${RESOURCE_PREFIX}aviatrix-cleanup-jobs')"
 
 if [ -f "$CONFIG_FILE" ] && aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
   FIRST_DEPLOY=false
@@ -179,16 +168,25 @@ if [[ "$enable_azure" =~ ^[Yy]$ ]]; then
   else
     echo "  None found — building the Azure SDK layer now (this can take a few minutes)..."
     LAYER_BUILD_DIR=$(mktemp -d)
+    # The layer zip regularly exceeds Lambda's ~50MB direct-upload limit for
+    # publish-layer-version --zip-file, so it's staged via S3 instead, which
+    # supports payloads up to the real 250MB unzipped layer limit.
+    LAYER_STAGING_BUCKET="${RESOURCE_PREFIX}aviatrix-cleanup-layer-staging-${ACCOUNT_ID}"
     if pip3 install -r layer/azure-sdk/requirements.txt -t "$LAYER_BUILD_DIR/python" \
         --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 >/dev/null 2>&1 \
       && (cd "$LAYER_BUILD_DIR" && zip -rq azure-sdk-layer.zip python/) \
+      && { aws s3api head-bucket --bucket "$LAYER_STAGING_BUCKET" --region "$REGION" >/dev/null 2>&1 \
+           || aws s3api create-bucket --bucket "$LAYER_STAGING_BUCKET" --region "$REGION" \
+                $( [ "$REGION" != "us-east-1" ] && echo "--create-bucket-configuration LocationConstraint=$REGION" ) >/dev/null 2>&1; } \
+      && aws s3 cp "$LAYER_BUILD_DIR/azure-sdk-layer.zip" "s3://$LAYER_STAGING_BUCKET/azure-sdk-layer.zip" --region "$REGION" >/dev/null 2>&1 \
       && AZURE_SDK_LAYER_ARN=$(aws lambda publish-layer-version \
            --layer-name "$AZURE_LAYER_NAME" \
-           --zip-file "fileb://$LAYER_BUILD_DIR/azure-sdk-layer.zip" \
+           --content "S3Bucket=$LAYER_STAGING_BUCKET,S3Key=azure-sdk-layer.zip" \
            --compatible-runtimes python3.12 \
            --region "$REGION" \
            --query LayerVersionArn --output text); then
       ok "Azure SDK layer published: $AZURE_SDK_LAYER_ARN"
+      aws s3 rm "s3://$LAYER_STAGING_BUCKET/azure-sdk-layer.zip" --region "$REGION" >/dev/null 2>&1 || true
     else
       AZURE_SDK_LAYER_ARN=""
       warn "Automated layer build failed — see docs/AZURE_LAYER.md to build it manually and redeploy with AzureSdkLayerArn set. Continuing without Azure support for now."
