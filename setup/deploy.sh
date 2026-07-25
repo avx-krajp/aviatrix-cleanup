@@ -246,6 +246,12 @@ OVERRIDES="StageName=prod ResourcePrefix=\"$RESOURCE_PREFIX\" LoginPassword=\"$L
 [ -n "$GCP_SA_SECRET_ARN" ]   && OVERRIDES="$OVERRIDES GcpSaSecretArn=\"$GCP_SA_SECRET_ARN\""
 
 if $FIRST_DEPLOY; then
+  # sam's --config-file existence check runs eager, before --guided gets a
+  # chance to create the file, so a brand-new per-user config name fails
+  # with "Config file ... does not exist or could not be read!" unless it's
+  # pre-created (empty is fine — sam treats a missing section as defaults).
+  [ -f "$CONFIG_FILE" ] || : > "$CONFIG_FILE"
+
   # First deploy for this stack: run the full wizard once so stack
   # name/region/capabilities get saved to its own config file for every
   # future run. Stack name and config file are pre-filled — press Enter
