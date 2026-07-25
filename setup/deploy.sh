@@ -43,14 +43,21 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     warn "AWS SAM CLI not found — installing via Homebrew..."
     brew install aws-sam-cli
   fi
+
+  if ! command -v node >/dev/null 2>&1; then
+    warn "Node.js not found — installing via Homebrew..."
+    brew install node
+  fi
 else
   command -v aws >/dev/null 2>&1 || { err "AWS CLI not found. Install it first."; exit 1; }
   command -v sam >/dev/null 2>&1 || { err "AWS SAM CLI not found. Install it first."; exit 1; }
+  command -v node >/dev/null 2>&1 || { err "Node.js not found. Install it first."; exit 1; }
 fi
 
 command -v aws >/dev/null 2>&1 || { err "AWS CLI install failed — install it manually and re-run."; exit 1; }
 command -v sam >/dev/null 2>&1 || { err "AWS SAM CLI install failed — install it manually and re-run."; exit 1; }
-ok "aws and sam CLIs found"
+command -v node >/dev/null 2>&1 || { err "Node.js install failed — install it manually and re-run."; exit 1; }
+ok "aws, sam and node found"
 
 if ! aws sts get-caller-identity >/dev/null 2>&1; then
   err "AWS credentials are not configured or have expired."
@@ -171,7 +178,12 @@ else
   eval sam deploy --region "$REGION" --parameter-overrides "$OVERRIDES"
 fi
 
-# ── 7. Upload the web app ────────────────────────────────────────────────────
+# ── 7. Build and upload the web app ─────────────────────────────────────────
+step "Building web app"
+
+(cd web && npm install && npm run build)
+ok "Web app built"
+
 step "Uploading web app"
 
 WEB_BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
@@ -181,7 +193,7 @@ DIST_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region
 WEB_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
   --query "Stacks[0].Outputs[?OutputKey=='WebUrl'].OutputValue" --output text)
 
-aws s3 sync ./web/ "s3://$WEB_BUCKET/" --delete
+aws s3 sync ./web/dist/ "s3://$WEB_BUCKET/" --delete
 aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths '/*' >/dev/null
 ok "Web app uploaded"
 

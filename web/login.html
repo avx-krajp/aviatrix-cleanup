@@ -4,66 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Sign In — Cloud Manager</title>
-  <link rel="icon" type="image/svg+xml" href="logo.svg">
-  <link rel="stylesheet" href="app.css">
+  <link rel="icon" type="image/svg+xml" href="/logo.svg">
 </head>
 <body>
-  <div class="login-box">
-    <img src="logo.svg" alt="" class="brand-hero">
-    <h1 class="brand-text large center">Cloud Manager</h1>
-    <p class="subtitle">Sign in to continue</p>
-    <form id="loginForm">
-      <div class="field">
-        <label>Passphrase</label>
-        <input type="password" id="password" autocomplete="current-password" autofocus required>
-      </div>
-      <button type="submit" class="primary" id="submitBtn">Sign In</button>
-    </form>
-    <div class="login-error" id="errorMsg" style="display:none"></div>
-  </div>
-
-  <script>
-    const form = document.getElementById('loginForm');
-    const errorMsg = document.getElementById('errorMsg');
-    const submitBtn = document.getElementById('submitBtn');
-
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      errorMsg.style.display = 'none';
-      submitBtn.disabled = true;
-      submitBtn.textContent = 'Signing in…';
-
-      try {
-        const password = document.getElementById('password').value;
-        const res = await fetch('/api/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'include',
-          body: JSON.stringify({ password }),
-        });
-
-        if (res.ok) {
-          const params = new URLSearchParams(window.location.search);
-          window.location.href = params.get('returnTo') || '/';
-          return;
-        }
-
-        if (res.status === 401) {
-          errorMsg.textContent = 'Incorrect passphrase.';
-        } else if (res.status === 429) {
-          errorMsg.textContent = 'Too many attempts. Try again in a minute.';
-        } else {
-          errorMsg.textContent = `Sign-in failed (HTTP ${res.status}).`;
-        }
-        errorMsg.style.display = 'block';
-      } catch (err) {
-        errorMsg.textContent = `Network error: ${err.message}`;
-        errorMsg.style.display = 'block';
-      } finally {
-        submitBtn.disabled = false;
-        submitBtn.textContent = 'Sign In';
-      }
-    });
-  </script>
+  <div id="app"></div>
+  <script type="module" src="/src/login.js"></script>
 </body>
 </html>
