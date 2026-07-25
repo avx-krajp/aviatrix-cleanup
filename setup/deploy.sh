@@ -174,6 +174,7 @@ if [[ "$enable_azure" =~ ^[Yy]$ ]]; then
     LAYER_STAGING_BUCKET="${RESOURCE_PREFIX}aviatrix-cleanup-layer-staging-${ACCOUNT_ID}"
     if pip3 install -r layer/azure-sdk/requirements.txt -t "$LAYER_BUILD_DIR/python" \
         --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 >/dev/null 2>&1 \
+      && python3 layer/azure-sdk/trim_unused_api_versions.py "$LAYER_BUILD_DIR/python" \
       && (cd "$LAYER_BUILD_DIR" && zip -rq azure-sdk-layer.zip python/) \
       && { aws s3api head-bucket --bucket "$LAYER_STAGING_BUCKET" --region "$REGION" >/dev/null 2>&1 \
            || aws s3api create-bucket --bucket "$LAYER_STAGING_BUCKET" --region "$REGION" \
