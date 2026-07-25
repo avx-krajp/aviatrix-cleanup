@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# setup/deploy.sh — guided deploy for Aviatrix Cloud Cleanup.
+# setup/deploy.sh — deploy for Aviatrix Cloud Cleanup.
 #
 # Auto-installs the AWS CLI, AWS SAM CLI and Node.js on macOS (via Homebrew)
 # if missing, checks your AWS credentials, optionally creates the Azure/GCP
 # Secrets Manager secrets, auto-builds and publishes the Azure SDK Lambda
 # layer if Azure support is enabled (reusing an existing published version
 # if one is found), generates the auth signing key, prompts for a login
-# passphrase, builds the web app, then runs `sam build && sam deploy` with
-# everything wired up.
+# passphrase, builds the web app, then runs `sam build && sam deploy`
+# non-interactively with everything wired up via --parameter-overrides.
 #
 # Requires a username (e.g. yours) to deploy your own fully isolated copy —
 # separate CloudFormation stack, DynamoDB tables, Lambdas, S3 bucket,
@@ -16,9 +16,8 @@
 # secrets, saved to its own samconfig.<username>.toml (gitignored). There is
 # no shared/blank stack option — every deploy is isolated.
 #
-# Safe to re-run — it detects an existing stack (per prefix) and skips the
-# --guided wizard on updates, reusing that stack's saved config file and any
-# resources that already exist (secrets, etc).
+# Safe to re-run — it detects an existing stack (per prefix) and reuses any
+# resources that already exist (secrets, etc), updating the stack in place.
 # =============================================================================
 set -euo pipefail
 
@@ -112,11 +111,8 @@ STACK_NAME="aviatrix-cleanup-${PREFIX_SLUG}"
 CONFIG_FILE="samconfig.${PREFIX_SLUG}.toml"
 ok "Isolated deploy — stack '$STACK_NAME' (underlying resources prefixed '${RESOURCE_PREFIX}', e.g. '${RESOURCE_PREFIX}aviatrix-cleanup-jobs')"
 
-if [ -f "$CONFIG_FILE" ] && aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
-  FIRST_DEPLOY=false
+if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
   ok "Existing stack '$STACK_NAME' found in $REGION — this will update it."
-else
-  FIRST_DEPLOY=true
 fi
 
 # ── 2. Login passphrase + signing key ───────────────────────────────────────
@@ -245,28 +241,21 @@ OVERRIDES="StageName=prod ResourcePrefix=\"$RESOURCE_PREFIX\" LoginPassword=\"$L
 [ -n "$AZURE_SDK_LAYER_ARN" ] && OVERRIDES="$OVERRIDES AzureSdkLayerArn=\"$AZURE_SDK_LAYER_ARN\""
 [ -n "$GCP_SA_SECRET_ARN" ]   && OVERRIDES="$OVERRIDES GcpSaSecretArn=\"$GCP_SA_SECRET_ARN\""
 
-if $FIRST_DEPLOY; then
-  # sam's --config-file existence check runs eager, before --guided gets a
-  # chance to create the file, so a brand-new per-user config name fails
-  # with "Config file ... does not exist or could not be read!" unless it's
-  # pre-created (empty is fine — sam treats a missing section as defaults).
-  [ -f "$CONFIG_FILE" ] || : > "$CONFIG_FILE"
+# sam's --config-file existence check runs eager, before the file would
+# otherwise get created, so a brand-new per-user config name fails with
+# "Config file ... does not exist or could not be read!" unless it's
+# pre-created (empty is fine — sam treats a missing section as defaults).
+[ -f "$CONFIG_FILE" ] || : > "$CONFIG_FILE"
 
-  # First deploy for this stack: run the full wizard once so stack
-  # name/region/capabilities get saved to its own config file for every
-  # future run. Stack name and config file are pre-filled — press Enter
-  # through the wizard's prompts to accept them.
-  ok "Guided deploy — stack name and config file are pre-filled, press Enter to accept."
-  eval sam deploy --guided --stack-name "$STACK_NAME" --config-file "$CONFIG_FILE" --region "$REGION" --parameter-overrides "$OVERRIDES"
-else
-  # Re-run: reuse this stack's saved config file, only override parameters.
-  eval sam deploy --stack-name "$STACK_NAME" --config-file "$CONFIG_FILE" --region "$REGION" --parameter-overrides "$OVERRIDES"
-fi
-
-if ! aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
-  err "Stack '$STACK_NAME' not found after deploy — did you type a different name in the guided wizard? Re-run and accept the pre-filled stack name."
-  exit 1
-fi
+# Not using `sam deploy --guided`: its wizard always re-prompts for NoEcho
+# parameters (LoginPassword, AuthSigningKey) with a blind hidden input and
+# silently discards whatever was passed via --parameter-overrides, so the
+# generated AuthSigningKey never actually reaches the stack. Deploying
+# non-interactively with every value already supplied on the command line
+# avoids that entirely, for both first deploys and updates.
+eval sam deploy --stack-name "$STACK_NAME" --config-file "$CONFIG_FILE" --region "$REGION" \
+  --parameter-overrides "$OVERRIDES" --resolve-s3 --capabilities CAPABILITY_IAM \
+  --no-confirm-changeset --no-fail-on-empty-changeset
 
 # ── 7. Build and upload the web app ─────────────────────────────────────────
 step "Building web app"
