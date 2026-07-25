@@ -14,6 +14,15 @@ Parameters:
   StageName:
     Type: String
     Default: prod
+  ResourcePrefix:
+    Type: String
+    Default: ""
+    AllowedPattern: "^([a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?-)?$"
+    Description: >
+      Optional prefix (including trailing hyphen, e.g. "alice-") prepended to
+      every named resource so multiple people can deploy independent copies
+      of this stack into the same AWS account without collisions. Leave
+      blank for the canonical "aviatrix-cleanup" production stack.
   AzureSpSecretArn:
     Type: String
     Default: ""
@@ -63,7 +72,7 @@ Resources:
   CleanupJobsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: aviatrix-cleanup-jobs
+      TableName: !Sub "${ResourcePrefix}aviatrix-cleanup-jobs"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: jobId
@@ -79,7 +88,7 @@ Resources:
   ScheduleTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: aviatrix-cleanup-schedule
+      TableName: !Sub "${ResourcePrefix}aviatrix-cleanup-schedule"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: id
@@ -112,7 +121,7 @@ Resources:
   StopRunnerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: aviatrix-cleanup-stop-runner
+      FunctionName: !Sub "${ResourcePrefix}aviatrix-cleanup-stop-runner"
       Handler: schedule_runner.handler
       CodeUri: lambda/
       MemorySize: 256
@@ -180,7 +189,7 @@ Resources:
   LoginFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: aviatrix-cleanup-login
+      FunctionName: !Sub "${ResourcePrefix}aviatrix-cleanup-login"
       Handler: auth_login.handler
       CodeUri: lambda/
       MemorySize: 128
@@ -212,7 +221,7 @@ Resources:
   AuthAuthorizerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: aviatrix-cleanup-authorizer
+      FunctionName: !Sub "${ResourcePrefix}aviatrix-cleanup-authorizer"
       Handler: auth_authorizer.handler
       CodeUri: lambda/
       MemorySize: 128
@@ -236,7 +245,7 @@ Resources:
   CleanupRoutesFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: aviatrix-cleanup-routes
+      FunctionName: !Sub "${ResourcePrefix}aviatrix-cleanup-routes"
       Handler: cleanup_routes.handler
       CodeUri: lambda/
       MemorySize: 512
@@ -247,6 +256,7 @@ Resources:
           SCHEDULE_TABLE:      !Ref ScheduleTable
           STOP_RUNNER_ARN:     !GetAtt StopRunnerFunction.Arn
           SCHEDULER_ROLE_ARN:  !GetAtt SchedulerInvokeRole.Arn
+          SCHEDULE_NAME:       !Sub "${ResourcePrefix}aviatrix-cleanup-stop-daily"
           AZURE_SP_SECRET_ARN: !Ref AzureSpSecretArn
           GCP_SA_SECRET_ARN:   !Ref GcpSaSecretArn
       Policies:
@@ -278,7 +288,7 @@ Resources:
                 - scheduler:UpdateSchedule
                 - scheduler:DeleteSchedule
                 - scheduler:GetSchedule
-              Resource: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/aviatrix-cleanup-stop-daily"
+              Resource: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/${ResourcePrefix}aviatrix-cleanup-stop-daily"
             - Effect: Allow
               Action: iam:PassRole
               Resource: !GetAtt SchedulerInvokeRole.Arn
@@ -387,7 +397,7 @@ Resources:
   CleanupWorkerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: aviatrix-cleanup-worker
+      FunctionName: !Sub "${ResourcePrefix}aviatrix-cleanup-worker"
       Handler: cleanup_worker.handler
       CodeUri: lambda/
       MemorySize: 1024
@@ -506,7 +516,7 @@ Resources:
   WebBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub "aviatrix-cleanup-web-${AWS::AccountId}"
+      BucketName: !Sub "${ResourcePrefix}aviatrix-cleanup-web-${AWS::AccountId}"
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -518,7 +528,7 @@ Resources:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
       OriginAccessControlConfig:
-        Name: aviatrix-cleanup-web-oac
+        Name: !Sub "${ResourcePrefix}aviatrix-cleanup-web-oac"
         OriginAccessControlOriginType: s3
         SigningBehavior: always
         SigningProtocol: sigv4
@@ -527,7 +537,7 @@ Resources:
   WebAuthFunction:
     Type: AWS::CloudFront::Function
     Properties:
-      Name: aviatrix-cleanup-auth-check
+      Name: !Sub "${ResourcePrefix}aviatrix-cleanup-auth-check"
       AutoPublish: true
       FunctionConfig:
         Comment: Verify cm_auth HMAC; redirect to /login.html if missing/invalid

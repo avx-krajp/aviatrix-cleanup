@@ -7,6 +7,7 @@
 # Web app build artifacts
 web/node_modules/
 web/dist/
+web/.vite/
 
 # Deployment zips
 *.zip
@@ -18,6 +19,9 @@ __pycache__/
 # Local env / secrets
 .env
 samconfig.local.toml
+
+# Per-person isolated-deploy SAM configs (samconfig.toml itself stays tracked)
+samconfig.*.toml
 
 # OS
 .DS_Store
