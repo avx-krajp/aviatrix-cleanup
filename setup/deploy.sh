@@ -137,26 +137,24 @@ AZURE_SDK_LAYER_ARN=""
 AZURE_SECRET_NAME="${RESOURCE_PREFIX}aviatrix-cleanup/azure-sp"
 read -rp "Enable Azure support? [y/N] " enable_azure
 if [[ "$enable_azure" =~ ^[Yy]$ ]]; then
-  read -rp "  Already have a Secrets Manager ARN to reuse (e.g. a shared org secret)? Leave blank to create/update $AZURE_SECRET_NAME: " AZURE_SP_SECRET_ARN
+  # Every deploy is isolated (see Step 1.5) — always collect a fresh SP for
+  # this stack's own secret rather than asking to reuse an ARN.
+  read -rp "  Azure tenant ID: " AZ_TENANT_ID
+  read -rp "  Azure client (app) ID: " AZ_CLIENT_ID
+  read -rsp "  Azure client secret: " AZ_CLIENT_SECRET; echo
+  read -rp "  Azure subscription ID: " AZ_SUB_ID
 
-  if [ -z "$AZURE_SP_SECRET_ARN" ]; then
-    read -rp "  Azure tenant ID: " AZ_TENANT_ID
-    read -rp "  Azure client (app) ID: " AZ_CLIENT_ID
-    read -rsp "  Azure client secret: " AZ_CLIENT_SECRET; echo
-    read -rp "  Azure subscription ID: " AZ_SUB_ID
+  SECRET_JSON=$(printf '{"tenantId":"%s","clientId":"%s","clientSecret":"%s","subscriptionId":"%s"}' \
+    "$AZ_TENANT_ID" "$AZ_CLIENT_ID" "$AZ_CLIENT_SECRET" "$AZ_SUB_ID")
 
-    SECRET_JSON=$(printf '{"tenantId":"%s","clientId":"%s","clientSecret":"%s","subscriptionId":"%s"}' \
-      "$AZ_TENANT_ID" "$AZ_CLIENT_ID" "$AZ_CLIENT_SECRET" "$AZ_SUB_ID")
-
-    if AZURE_SP_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$AZURE_SECRET_NAME" --query ARN --output text 2>/dev/null); then
-      warn "Secret $AZURE_SECRET_NAME already exists — updating it."
-      aws secretsmanager put-secret-value --secret-id "$AZURE_SECRET_NAME" --secret-string "$SECRET_JSON" >/dev/null
-    else
-      AZURE_SP_SECRET_ARN=$(aws secretsmanager create-secret \
-        --name "$AZURE_SECRET_NAME" \
-        --secret-string "$SECRET_JSON" \
-        --query ARN --output text)
-    fi
+  if AZURE_SP_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$AZURE_SECRET_NAME" --query ARN --output text 2>/dev/null); then
+    warn "Secret $AZURE_SECRET_NAME already exists — updating it."
+    aws secretsmanager put-secret-value --secret-id "$AZURE_SECRET_NAME" --secret-string "$SECRET_JSON" >/dev/null
+  else
+    AZURE_SP_SECRET_ARN=$(aws secretsmanager create-secret \
+      --name "$AZURE_SECRET_NAME" \
+      --secret-string "$SECRET_JSON" \
+      --query ARN --output text)
   fi
   ok "Azure secret ready: $AZURE_SP_SECRET_ARN"
 
@@ -206,23 +204,21 @@ GCP_SA_SECRET_ARN=""
 GCP_SECRET_NAME="${RESOURCE_PREFIX}aviatrix-cleanup/gcp-sa"
 read -rp "Enable GCP support? [y/N] " enable_gcp
 if [[ "$enable_gcp" =~ ^[Yy]$ ]]; then
-  read -rp "  Already have a Secrets Manager ARN to reuse (e.g. a shared org secret)? Leave blank to create/update $GCP_SECRET_NAME: " GCP_SA_SECRET_ARN
-
-  if [ -z "$GCP_SA_SECRET_ARN" ]; then
-    read -rp "  Path to your GCP service account key JSON file: " GCP_KEY_PATH
-    if [ ! -f "$GCP_KEY_PATH" ]; then
-      err "File not found: $GCP_KEY_PATH"
-      exit 1
-    fi
-    if GCP_SA_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$GCP_SECRET_NAME" --query ARN --output text 2>/dev/null); then
-      warn "Secret $GCP_SECRET_NAME already exists — updating it."
-      aws secretsmanager put-secret-value --secret-id "$GCP_SECRET_NAME" --secret-string "file://$GCP_KEY_PATH" >/dev/null
-    else
-      GCP_SA_SECRET_ARN=$(aws secretsmanager create-secret \
-        --name "$GCP_SECRET_NAME" \
-        --secret-string "file://$GCP_KEY_PATH" \
-        --query ARN --output text)
-    fi
+  # Every deploy is isolated (see Step 1.5) — always collect a fresh key file
+  # for this stack's own secret rather than asking to reuse an ARN.
+  read -rp "  Path to your GCP service account key JSON file: " GCP_KEY_PATH
+  if [ ! -f "$GCP_KEY_PATH" ]; then
+    err "File not found: $GCP_KEY_PATH"
+    exit 1
+  fi
+  if GCP_SA_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$GCP_SECRET_NAME" --query ARN --output text 2>/dev/null); then
+    warn "Secret $GCP_SECRET_NAME already exists — updating it."
+    aws secretsmanager put-secret-value --secret-id "$GCP_SECRET_NAME" --secret-string "file://$GCP_KEY_PATH" >/dev/null
+  else
+    GCP_SA_SECRET_ARN=$(aws secretsmanager create-secret \
+      --name "$GCP_SECRET_NAME" \
+      --secret-string "file://$GCP_KEY_PATH" \
+      --query ARN --output text)
   fi
   ok "GCP secret ready: $GCP_SA_SECRET_ARN"
 else
