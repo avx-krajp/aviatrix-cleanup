@@ -255,10 +255,6 @@
     </div>
   {:else if cleanupStep === 2}
     <div transition:fade={{ duration: 180 }}>
-      <div class="center" style="margin: 16px 0; color: var(--primary-light)">
-        <Icon name="loader" size={44} strokeWidth={1.5} class="spinner-icon" />
-      </div>
-
       {#if !job && !cleanupError}
         <div class="center">
           <p style="margin-bottom: 12px">Starting job…</p>

@@ -60,7 +60,9 @@ def _is_avx_azure_sku(sku: str) -> bool:
 
 def _fetch_region_instances(region: str) -> list:
     client = boto3.client("ec2", region_name=region)
-    response = client.describe_instances()
+    response = client.describe_instances(
+        Filters=[{"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]}]
+    )
     reservations = response["Reservations"]
 
     image_ids = {
