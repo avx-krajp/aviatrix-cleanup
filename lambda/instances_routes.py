@@ -256,7 +256,7 @@ def get_azure_instances(event: dict) -> dict:
         url = (
             f"https://management.azure.com/subscriptions/{subscription_id}"
             f"/providers/Microsoft.Compute/virtualMachines"
-            f"?api-version=2023-03-01&$expand=instanceView"
+            f"?api-version=2023-03-01&statusOnly=true"
         )
         result, error = _azure_api_call(url)
         if error:
