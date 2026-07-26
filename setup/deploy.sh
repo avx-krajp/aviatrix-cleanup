@@ -119,10 +119,20 @@ fi
 step "Web login setup"
 
 LOGIN_PASSWORD=""
-while [ ${#LOGIN_PASSWORD} -lt 12 ]; do
+while true; do
   read -rsp "Choose a login passphrase for the web app (min 12 chars): " LOGIN_PASSWORD
   echo
-  [ ${#LOGIN_PASSWORD} -lt 12 ] && warn "Too short (${#LOGIN_PASSWORD} chars) — try again."
+  if [ ${#LOGIN_PASSWORD} -lt 12 ]; then
+    warn "Too short (${#LOGIN_PASSWORD} chars) — try again."
+    continue
+  fi
+  read -rsp "Confirm passphrase: " LOGIN_PASSWORD_CONFIRM
+  echo
+  if [ "$LOGIN_PASSWORD" != "$LOGIN_PASSWORD_CONFIRM" ]; then
+    warn "Passphrases do not match — try again."
+    continue
+  fi
+  break
 done
 ok "Passphrase set"
 
@@ -276,5 +286,5 @@ aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths '/*' >/d
 ok "Web app uploaded"
 
 printf "\n${G}${B}Done.${N} Open %s and log in with the passphrase you set.\n\n" "$WEB_URL"
-printf "Stack name:  ${B}%s${N}\nConfig file: ${B}%s${N}\n" "$STACK_NAME" "$CONFIG_FILE"
-printf "To tear down: ${B}./setup/teardown.sh %s${N}\n\n" "$PREFIX_SLUG"
+printf "Stack name:  ${B}%s${N}\nConfig file: ${B}%s${N}\n\n" "$STACK_NAME" "$CONFIG_FILE"
+printf "To tear down, run:\n${B}cd %s && ./setup/teardown.sh %s${N}\n\n" "$REPO_ROOT" "$PREFIX_SLUG"
