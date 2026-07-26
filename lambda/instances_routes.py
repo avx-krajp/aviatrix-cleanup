@@ -253,17 +253,35 @@ def get_azure_instances(event: dict) -> dict:
     region = _params(event).get("region")
     try:
         subscription_id = azure_sp_raw()["subscriptionId"]
-        url = (
+        base_url = (
             f"https://management.azure.com/subscriptions/{subscription_id}"
-            f"/providers/Microsoft.Compute/virtualMachines"
-            f"?api-version=2023-03-01&statusOnly=true"
+            f"/providers/Microsoft.Compute/virtualMachines?api-version=2023-03-01"
         )
-        result, error = _azure_api_call(url)
+
+        # The subscription-wide "list all VMs" endpoint can't return both
+        # power state and hardware/storage profile in one call: statusOnly=true
+        # gives instanceView (power state) but strips hardwareProfile.vmSize
+        # and storageProfile.imageReference.sku; a plain call gives the reverse.
+        # Fetch both and merge by VM id — still O(1) calls regardless of VM count.
+        status_result, error = _azure_api_call(f"{base_url}&statusOnly=true")
+        if error:
+            return _resp(500, {"status": "error", "message": error})
+        profile_result, error = _azure_api_call(base_url)
         if error:
             return _resp(500, {"status": "error", "message": error})
 
+        power_states = {}
+        for vm in status_result.get("value", []):
+            power_state = "unknown"
+            for status in vm.get("properties", {}).get("instanceView", {}).get("statuses", []):
+                code = status.get("code", "")
+                if code.startswith("PowerState/"):
+                    power_state = code.replace("PowerState/", "")
+                    break
+            power_states[vm.get("id", "")] = power_state
+
         vms = []
-        for vm in result.get("value", []):
+        for vm in profile_result.get("value", []):
             vm_id = vm.get("id", "")
             vm_location = vm.get("location", "")
             resource_group = (
@@ -272,14 +290,6 @@ def get_azure_instances(event: dict) -> dict:
             )
             if region and vm_location.lower() != region.lower():
                 continue
-
-            power_state = "unknown"
-            instance_view = vm.get("properties", {}).get("instanceView", {})
-            for status in instance_view.get("statuses", []):
-                code = status.get("code", "")
-                if code.startswith("PowerState/"):
-                    power_state = code.replace("PowerState/", "")
-                    break
 
             sku = (
                 vm.get("plan", {}).get("name", "")
@@ -295,7 +305,7 @@ def get_azure_instances(event: dict) -> dict:
             vms.append({
                 "id":            vm_id,
                 "name":          vm.get("name", ""),
-                "state":         _map_azure_state(power_state),
+                "state":         _map_azure_state(power_states.get(vm_id, "unknown")),
                 "instanceType":  vm.get("properties", {}).get("hardwareProfile", {}).get("vmSize", "unknown"),
                 "region":        vm_location,
                 "resourceGroup": resource_group,
