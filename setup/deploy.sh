@@ -276,4 +276,5 @@ aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths '/*' >/d
 ok "Web app uploaded"
 
 printf "\n${G}${B}Done.${N} Open %s and log in with the passphrase you set.\n\n" "$WEB_URL"
-printf "Stack name:  ${B}%s${N}\nConfig file: ${B}%s${N}\n(use these with 'sam delete --stack-name ... --config-file ...' to tear down)\n\n" "$STACK_NAME" "$CONFIG_FILE"
+printf "Stack name:  ${B}%s${N}\nConfig file: ${B}%s${N}\n" "$STACK_NAME" "$CONFIG_FILE"
+printf "To tear down: ${B}./setup/teardown.sh %s${N}\n\n" "$PREFIX_SLUG"

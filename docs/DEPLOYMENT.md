@@ -99,29 +99,27 @@ Visit the `WebUrl` output and log in with the passphrase from step 5.
 
 ## Tearing down an isolated deploy
 
-`sam delete --stack-name <prefix>-aviatrix-cleanup --config-file samconfig.<prefix>.toml`
-removes the CloudFormation stack, but **not** the EventBridge Scheduler
-entry `<prefix>-aviatrix-cleanup-stop-daily` if you ever set a schedule
-through the app — that's created imperatively by the Lambda, not as a
-stack resource. Delete it manually if present:
+```bash
+./setup/teardown.sh <prefix>
+```
+
+`sam delete` alone isn't enough here: CloudFormation refuses to delete a
+non-empty S3 bucket (the web bucket always has files in it after deploy),
+and two other things aren't stack resources at all — the EventBridge
+Scheduler entry `<prefix>-aviatrix-cleanup-stop-daily` (created
+imperatively by the Lambda if you ever set a schedule through the app) and
+the Azure SDK layer staging bucket `<prefix>aviatrix-cleanup-layer-staging-<account-id>`
+(created by `setup/deploy.sh` to publish the layer). `setup/teardown.sh`
+deletes the schedule if present, empties the web bucket, removes the layer
+staging bucket if present, then runs `sam delete` — so nothing is left
+behind and nothing needs to be done in a specific order by hand.
+
+If you'd rather do it manually, or the script isn't available, the
+individual steps are:
 
 ```bash
 aws scheduler delete-schedule --name <prefix>-aviatrix-cleanup-stop-daily --group-name default
-```
-
-Also empty the S3 web bucket before deleting the stack — CloudFormation
-won't delete a non-empty bucket:
-
-```bash
 aws s3 rm s3://<prefix>-aviatrix-cleanup-web-<account-id>/ --recursive
-```
-
-If Azure support was enabled, `setup/deploy.sh` also creates a small S3
-bucket (`<prefix>aviatrix-cleanup-layer-staging-<account-id>`) to stage the
-Azure SDK layer zip during publish — also not a stack resource, so it
-survives `sam delete` too. Delete it once you no longer need to
-redeploy/update the Azure layer:
-
-```bash
 aws s3 rb s3://<prefix>aviatrix-cleanup-layer-staging-<account-id> --force
+sam delete --stack-name aviatrix-cleanup-<prefix> --config-file samconfig.<prefix>.toml
 ```
