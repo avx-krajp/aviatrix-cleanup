@@ -167,29 +167,32 @@ if [[ "$enable_azure" =~ ^[Yy]$ ]]; then
   else
     echo "  None found — building the Azure SDK layer now (this can take a few minutes)..."
     LAYER_BUILD_DIR=$(mktemp -d)
+    LAYER_BUILD_LOG="$LAYER_BUILD_DIR/build.log"
     # The layer zip regularly exceeds Lambda's ~50MB direct-upload limit for
     # publish-layer-version --zip-file, so it's staged via S3 instead, which
     # supports payloads up to the real 250MB unzipped layer limit.
     LAYER_STAGING_BUCKET="${RESOURCE_PREFIX}aviatrix-cleanup-layer-staging-${ACCOUNT_ID}"
     if pip3 install -r layer/azure-sdk/requirements.txt -t "$LAYER_BUILD_DIR/python" \
-        --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 >/dev/null 2>&1 \
+        --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 >"$LAYER_BUILD_LOG" 2>&1 \
       && python3 layer/azure-sdk/trim_unused_api_versions.py "$LAYER_BUILD_DIR/python" \
       && (cd "$LAYER_BUILD_DIR" && zip -rq azure-sdk-layer.zip python/) \
-      && { aws s3api head-bucket --bucket "$LAYER_STAGING_BUCKET" --region "$REGION" >/dev/null 2>&1 \
+      && { aws s3api head-bucket --bucket "$LAYER_STAGING_BUCKET" --region "$REGION" >>"$LAYER_BUILD_LOG" 2>&1 \
            || aws s3api create-bucket --bucket "$LAYER_STAGING_BUCKET" --region "$REGION" \
-                $( [ "$REGION" != "us-east-1" ] && echo "--create-bucket-configuration LocationConstraint=$REGION" ) >/dev/null 2>&1; } \
-      && aws s3 cp "$LAYER_BUILD_DIR/azure-sdk-layer.zip" "s3://$LAYER_STAGING_BUCKET/azure-sdk-layer.zip" --region "$REGION" >/dev/null 2>&1 \
+                $( [ "$REGION" != "us-east-1" ] && echo "--create-bucket-configuration LocationConstraint=$REGION" ) >>"$LAYER_BUILD_LOG" 2>&1; } \
+      && aws s3 cp "$LAYER_BUILD_DIR/azure-sdk-layer.zip" "s3://$LAYER_STAGING_BUCKET/azure-sdk-layer.zip" --region "$REGION" >>"$LAYER_BUILD_LOG" 2>&1 \
       && AZURE_SDK_LAYER_ARN=$(aws lambda publish-layer-version \
            --layer-name "$AZURE_LAYER_NAME" \
            --content "S3Bucket=$LAYER_STAGING_BUCKET,S3Key=azure-sdk-layer.zip" \
            --compatible-runtimes python3.12 \
            --region "$REGION" \
-           --query LayerVersionArn --output text); then
+           --query LayerVersionArn --output text 2>>"$LAYER_BUILD_LOG"); then
       ok "Azure SDK layer published: $AZURE_SDK_LAYER_ARN"
       aws s3 rm "s3://$LAYER_STAGING_BUCKET/azure-sdk-layer.zip" --region "$REGION" >/dev/null 2>&1 || true
     else
       AZURE_SDK_LAYER_ARN=""
-      warn "Automated layer build failed — see docs/AZURE_LAYER.md to build it manually and redeploy with AzureSdkLayerArn set. Continuing without Azure support for now."
+      err "Automated layer build failed — output below:"
+      cat "$LAYER_BUILD_LOG" >&2
+      warn "See docs/AZURE_LAYER.md to build it manually and redeploy with AzureSdkLayerArn set. Continuing without Azure support for now."
     fi
     rm -rf "$LAYER_BUILD_DIR"
   fi
