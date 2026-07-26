@@ -49,9 +49,7 @@
   function cleanupNext() { deleteText = ''; cleanupStep = 1; }
   function cleanupBack() { cleanupStep = Math.max(0, cleanupStep - 1); }
 
-  function canProceedCleanup() {
-    return dryRun || deleteText.toUpperCase() === 'DELETE';
-  }
+  $: canProceedCleanup = dryRun || deleteText.toUpperCase() === 'DELETE';
 
   async function cleanupConfirm() {
     cleanupStep = 2;
@@ -249,7 +247,7 @@
       <div style="display: flex; gap: 12px;">
         <button class="primary secondary" style="flex: 1" on:click={cleanupBack}><Icon name="arrow-left" size={15} />Back</button>
         <button class="primary danger" style="flex: 1"
-          disabled={!canProceedCleanup()}
+          disabled={!canProceedCleanup}
           on:click={cleanupConfirm}>
           {dryRun ? 'Start Dry Run' : 'Delete Now'}
         </button>
