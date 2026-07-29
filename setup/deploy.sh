@@ -242,6 +242,24 @@ fi
 step "Building"
 sam build
 
+# SAM's incremental build cache (.aws-sam/deps/) has been observed leaving
+# empty directory stubs for a pip-installed package (present in listing,
+# zero actual .py files inside) after repeated builds in the same working
+# tree — the failure is silent here and only surfaces later as an
+# ImportError deep inside a Lambda invocation (e.g. "cannot import name
+# 'service_account' from 'google.oauth2'"), which is a much worse place to
+# discover it. Check the one third-party import GCP cleanup actually needs
+# and rebuild clean if it's missing, rather than deploying broken code.
+if [ ! -f ".aws-sam/build/CleanupWorkerFunction/google/oauth2/service_account.py" ]; then
+  warn "google-auth dependency looks incomplete after sam build — rebuilding clean"
+  sam build --no-cached
+fi
+if [ ! -f ".aws-sam/build/CleanupWorkerFunction/google/oauth2/service_account.py" ]; then
+  err "google-auth still missing after a clean rebuild — GCP cleanup will fail with an ImportError."
+  err "Try removing .aws-sam/ entirely and re-running this script."
+  exit 1
+fi
+
 # ── 6. Deploy ─────────────────────────────────────────────────────────────────
 step "Deploying"
 
