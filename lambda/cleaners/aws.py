@@ -63,6 +63,27 @@ class AWSCleaner(BaseCleaner):
         )
         return [s["SubnetId"] for s in r.get("Subnets", [])]
 
+    def _poll_until_gone(self, still_exists_fn, max_wait=300, interval=15) -> bool:
+        """Poll still_exists_fn() (True while the resource still exists) until
+        it returns False or max_wait seconds elapse. Returns True if it
+        cleared in time, False if it timed out — callers log a warning and
+        move on rather than block the whole job on one slow-to-delete
+        resource. Skipped entirely in dry-run (nothing was actually deleted).
+        Exceptions from still_exists_fn propagate to the caller's own
+        try/except rather than being swallowed here, so an unexpected error
+        (e.g. throttling) surfaces as a real step error instead of being
+        silently treated as "resource is gone"."""
+        if self.dry_run:
+            return True
+        elapsed = 0
+        while True:
+            if not still_exists_fn():
+                return True
+            if elapsed >= max_wait:
+                return False
+            time.sleep(interval)
+            elapsed += interval
+
     def _vpc_list(self) -> list[str]:
         """Return [vpc_id] if specified, else all non-default VPCs in region.
         Returns None if the region is not enabled on this account."""
@@ -89,18 +110,44 @@ class AWSCleaner(BaseCleaner):
                 info = self.eks.describe_cluster(name=name)["cluster"]
                 if info.get("resourcesVpcConfig", {}).get("vpcId") != self.vpc_id:
                     continue
-                # node groups
+                # node groups — EKS refuses DeleteCluster while any remain,
+                # and each nodegroup's worker ENIs block subnet/SG deletion.
                 ngs = self.eks.list_nodegroups(clusterName=name).get("nodegroups", [])
                 for ng in ngs:
                     details.append(self._delete(f"EKS nodegroup {ng}",
                         self.eks.delete_nodegroup, clusterName=name, nodegroupName=ng))
+                for ng in ngs:
+                    cleared = self._poll_until_gone(
+                        lambda name=name, ng=ng: ng in self.eks.list_nodegroups(
+                            clusterName=name).get("nodegroups", []),
+                        max_wait=600, interval=15)
+                    if not cleared:
+                        details.append(f"warn: EKS nodegroup {ng} still deleting after wait")
                 # fargate profiles
                 fps = self.eks.list_fargate_profiles(clusterName=name).get("fargateProfileNames", [])
                 for fp in fps:
                     details.append(self._delete(f"EKS fargate-profile {fp}",
                         self.eks.delete_fargate_profile, clusterName=name, fargateProfileName=fp))
+                for fp in fps:
+                    cleared = self._poll_until_gone(
+                        lambda name=name, fp=fp: fp in self.eks.list_fargate_profiles(
+                            clusterName=name).get("fargateProfileNames", []),
+                        max_wait=300, interval=15)
+                    if not cleared:
+                        details.append(f"warn: EKS fargate-profile {fp} still deleting after wait")
                 details.append(self._delete(f"EKS cluster {name}",
                     self.eks.delete_cluster, name=name))
+                # Cluster's control-plane ENIs (in the VPC's subnets) aren't
+                # released until the cluster itself is fully gone.
+                def _cluster_exists(name=name):
+                    try:
+                        self.eks.describe_cluster(name=name)
+                        return True
+                    except self.eks.exceptions.ResourceNotFoundException:
+                        return False
+                cleared = self._poll_until_gone(_cluster_exists, max_wait=600, interval=15)
+                if not cleared:
+                    details.append(f"warn: EKS cluster {name} still deleting after wait")
         except Exception as exc:
             details.append(f"error: {exc}")
         self._finalize(1, "EKS Clusters", details)
@@ -176,12 +223,23 @@ class AWSCleaner(BaseCleaner):
                     {"Name": "state",  "Values": ["available", "pending"]},
                 ]
             )
-            for nat in r.get("NatGateways", []):
-                nid = nat["NatGatewayId"]
+            nat_ids = [nat["NatGatewayId"] for nat in r.get("NatGateways", [])]
+            for nid in nat_ids:
                 details.append(self._delete(f"NAT {nid}",
                     self.ec2.delete_nat_gateway, NatGatewayId=nid))
-            if details and not self.dry_run:
-                time.sleep(30)
+            if nat_ids:
+                # NAT deletion releases its ENI only once state reaches
+                # 'deleted' — 'deleting' still holds it and blocks subnet/SG
+                # cleanup, so poll for the real terminal state rather than a
+                # fixed guess.
+                cleared = self._poll_until_gone(
+                    lambda: bool(self.ec2.describe_nat_gateways(
+                        Filters=[{"Name": "nat-gateway-id", "Values": nat_ids},
+                                 {"Name": "state", "Values": ["deleting"]}]
+                    ).get("NatGateways", [])),
+                    max_wait=300, interval=15)
+                if not cleared:
+                    details.append(f"warn: NAT gateways {nat_ids} still deleting after wait")
         except Exception as exc:
             details.append(f"error: {exc}")
         self._finalize(4, "NAT Gateways", details)
@@ -195,6 +253,7 @@ class AWSCleaner(BaseCleaner):
                    for sg in self.rds.describe_db_subnet_groups()["DBSubnetGroups"]
                    if sg.get("VpcId") == self.vpc_id}
             # clusters
+            cluster_ids = []
             for c in self.rds.describe_db_clusters()["DBClusters"]:
                 if c.get("DBSubnetGroup") in sgs and c["Status"] != "deleting":
                     cid = c["DBClusterIdentifier"]
@@ -203,7 +262,9 @@ class AWSCleaner(BaseCleaner):
                         DBClusterIdentifier=cid,
                         SkipFinalSnapshot=True,
                         DeleteAutomatedBackups=True))
+                    cluster_ids.append(cid)
             # standalone instances
+            instance_ids = []
             for i in self.rds.describe_db_instances()["DBInstances"]:
                 sg = i.get("DBSubnetGroup", {}).get("DBSubnetGroupName", "")
                 if sg in sgs and i["DBInstanceStatus"] != "deleting" \
@@ -214,6 +275,28 @@ class AWSCleaner(BaseCleaner):
                         DBInstanceIdentifier=iid,
                         SkipFinalSnapshot=True,
                         DeleteAutomatedBackups=True))
+                    instance_ids.append(iid)
+            # RDS holds ENIs in the VPC's subnets until deletion fully
+            # completes — wait for the real terminal state (not a guess)
+            # before subnet/SG cleanup runs later in this pass.
+            if instance_ids:
+                cleared = self._poll_until_gone(
+                    lambda: any(
+                        i["DBInstanceIdentifier"] in instance_ids
+                        for i in self.rds.describe_db_instances().get("DBInstances", [])
+                    ),
+                    max_wait=900, interval=20)
+                if not cleared:
+                    details.append(f"warn: RDS instances {instance_ids} still deleting after wait")
+            if cluster_ids:
+                cleared = self._poll_until_gone(
+                    lambda: any(
+                        c["DBClusterIdentifier"] in cluster_ids
+                        for c in self.rds.describe_db_clusters().get("DBClusters", [])
+                    ),
+                    max_wait=900, interval=20)
+                if not cleared:
+                    details.append(f"warn: RDS clusters {cluster_ids} still deleting after wait")
         except Exception as exc:
             details.append(f"error: {exc}")
         self._finalize(5, "RDS Clusters + Instances", details)
@@ -225,6 +308,7 @@ class AWSCleaner(BaseCleaner):
             sgs = {sg["CacheSubnetGroupName"]
                    for sg in self.ecache.describe_cache_subnet_groups()["CacheSubnetGroups"]
                    if sg.get("VpcId") == self.vpc_id}
+            rg_ids = []
             for rg in self.ecache.describe_replication_groups()["ReplicationGroups"]:
                 if rg["Status"] == "deleting":
                     continue
@@ -238,6 +322,8 @@ class AWSCleaner(BaseCleaner):
                         self.ecache.delete_replication_group,
                         ReplicationGroupId=rgid,
                         RetainPrimaryCluster=False))
+                    rg_ids.append(rgid)
+            cluster_ids = []
             for c in self.ecache.describe_cache_clusters()["CacheClusters"]:
                 sg = c.get("CacheSubnetGroup", {}).get("CacheSubnetGroupName", "")
                 if sg in sgs and c["CacheClusterStatus"] != "deleting" \
@@ -245,6 +331,28 @@ class AWSCleaner(BaseCleaner):
                     cid = c["CacheClusterId"]
                     details.append(self._delete(f"ElastiCache cluster {cid}",
                         self.ecache.delete_cache_cluster, CacheClusterId=cid))
+                    cluster_ids.append(cid)
+            # ElastiCache nodes hold ENIs in the VPC's subnets until deletion
+            # fully completes — wait for the real terminal state before
+            # subnet/SG cleanup runs later in this pass.
+            if rg_ids:
+                cleared = self._poll_until_gone(
+                    lambda: any(
+                        rg["ReplicationGroupId"] in rg_ids
+                        for rg in self.ecache.describe_replication_groups().get("ReplicationGroups", [])
+                    ),
+                    max_wait=600, interval=20)
+                if not cleared:
+                    details.append(f"warn: ElastiCache replication groups {rg_ids} still deleting after wait")
+            if cluster_ids:
+                cleared = self._poll_until_gone(
+                    lambda: any(
+                        c["CacheClusterId"] in cluster_ids
+                        for c in self.ecache.describe_cache_clusters().get("CacheClusters", [])
+                    ),
+                    max_wait=600, interval=20)
+                if not cleared:
+                    details.append(f"warn: ElastiCache clusters {cluster_ids} still deleting after wait")
         except Exception as exc:
             details.append(f"error: {exc}")
         self._finalize(6, "ElastiCache", details)
@@ -262,12 +370,23 @@ class AWSCleaner(BaseCleaner):
                 in_vpc = [mt for mt in mts if mt.get("SubnetId") in subnets]
                 if not in_vpc:
                     continue
-                for mt in in_vpc:
-                    mtid = mt["MountTargetId"]
+                mt_ids = [mt["MountTargetId"] for mt in in_vpc]
+                for mtid in mt_ids:
                     details.append(self._delete(f"EFS mount-target {mtid}",
                         self.efs.delete_mount_target, MountTargetId=mtid))
-                if not self.dry_run:
-                    time.sleep(20)
+                # Each mount target owns an ENI in the VPC's subnets — wait
+                # for the real terminal state, not a fixed guess, before
+                # deleting the filesystem and before subnet/SG cleanup runs
+                # later in this pass.
+                cleared = self._poll_until_gone(
+                    lambda: any(
+                        mt["MountTargetId"] in mt_ids
+                        for mt in self.efs.describe_mount_targets(FileSystemId=fsid)
+                            .get("MountTargets", [])
+                    ),
+                    max_wait=300, interval=10)
+                if not cleared:
+                    details.append(f"warn: EFS mount targets {mt_ids} still deleting after wait")
                 details.append(self._delete(f"EFS fs {fsid}",
                     self.efs.delete_file_system, FileSystemId=fsid))
         except Exception as exc:
@@ -279,14 +398,28 @@ class AWSCleaner(BaseCleaner):
         details = []
         try:
             domains = self.opensearch.list_domain_names()["DomainNames"]
+            names = []
             for d in domains:
                 name = d["DomainName"]
                 info = self.opensearch.describe_domain(DomainName=name)["DomainStatus"]
                 if info.get("VPCOptions", {}).get("VPCId") == self.vpc_id:
                     details.append(self._delete(f"OpenSearch domain {name}",
                         self.opensearch.delete_domain, DomainName=name))
-            if details and not self.dry_run:
-                time.sleep(30)
+                    names.append(name)
+            # OpenSearch domains hold VPC ENIs until deletion fully
+            # completes — wait for the real terminal state before subnet/SG
+            # cleanup runs later in this pass.
+            def _domain_exists(name):
+                try:
+                    info = self.opensearch.describe_domain(DomainName=name)["DomainStatus"]
+                    return not info.get("Deleted", False)
+                except self.opensearch.exceptions.ResourceNotFoundException:
+                    return False
+            for name in names:
+                cleared = self._poll_until_gone(
+                    lambda name=name: _domain_exists(name), max_wait=900, interval=20)
+                if not cleared:
+                    details.append(f"warn: OpenSearch domain {name} still deleting after wait")
         except Exception as exc:
             details.append(f"error: {exc}")
         self._finalize(8, "OpenSearch Domains", details)
@@ -297,6 +430,7 @@ class AWSCleaner(BaseCleaner):
         try:
             subnets = set(self._vpc_subnets())
             r = self.kafka.list_clusters_v2()
+            arns = []
             for c in r.get("ClusterInfoList", []):
                 if c.get("State") == "DELETING":
                     continue
@@ -310,8 +444,21 @@ class AWSCleaner(BaseCleaner):
                 if client_subnets & subnets:
                     details.append(self._delete(f"MSK cluster {arn}",
                         self.kafka.delete_cluster, ClusterArn=arn))
-            if details and not self.dry_run:
-                time.sleep(30)
+                    arns.append(arn)
+            # MSK brokers hold ENIs in the VPC's subnets until deletion fully
+            # completes — wait for the real terminal state before subnet/SG
+            # cleanup runs later in this pass.
+            def _cluster_exists(arn):
+                try:
+                    self.kafka.describe_cluster_v2(ClusterArn=arn)
+                    return True
+                except self.kafka.exceptions.NotFoundException:
+                    return False
+            for arn in arns:
+                cleared = self._poll_until_gone(
+                    lambda arn=arn: _cluster_exists(arn), max_wait=900, interval=20)
+                if not cleared:
+                    details.append(f"warn: MSK cluster {arn} still deleting after wait")
         except Exception as exc:
             details.append(f"error: {exc}")
         self._finalize(9, "MSK (Kafka) Clusters", details)
@@ -320,6 +467,7 @@ class AWSCleaner(BaseCleaner):
         self._emit(10, "Redshift Clusters", "running")
         details = []
         try:
+            cluster_ids = []
             for c in self.redshift.describe_clusters()["Clusters"]:
                 if c.get("VpcId") == self.vpc_id and c["ClusterStatus"] != "deleting":
                     cid = c["ClusterIdentifier"]
@@ -327,6 +475,19 @@ class AWSCleaner(BaseCleaner):
                         self.redshift.delete_cluster,
                         ClusterIdentifier=cid,
                         SkipFinalClusterSnapshot=True))
+                    cluster_ids.append(cid)
+            # Redshift holds ENIs in the VPC's subnets until deletion fully
+            # completes — wait for the real terminal state before subnet/SG
+            # cleanup runs later in this pass.
+            if cluster_ids:
+                cleared = self._poll_until_gone(
+                    lambda: any(
+                        c["ClusterIdentifier"] in cluster_ids
+                        for c in self.redshift.describe_clusters().get("Clusters", [])
+                    ),
+                    max_wait=900, interval=20)
+                if not cleared:
+                    details.append(f"warn: Redshift clusters {cluster_ids} still deleting after wait")
         except Exception as exc:
             details.append(f"error: {exc}")
         self._finalize(10, "Redshift Clusters", details)
