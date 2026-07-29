@@ -1,5 +1,5 @@
 """
-aws.py — AWSCleaner (mirrors lib/aws_cleanup.sh — 30 steps)
+aws.py — AWSCleaner (mirrors lib/aws_cleanup.sh — 31 steps)
 """
 
 import time
@@ -10,7 +10,7 @@ from job_store import update_job, step_record
 
 
 class AWSCleaner(BaseCleaner):
-    TOTAL = 30
+    TOTAL = 31
 
     def __init__(self, region: str, vpc_id: str, dry_run: bool,
                  table, job_id: str):
@@ -31,6 +31,9 @@ class AWSCleaner(BaseCleaner):
         self.kafka    = boto3.client("kafka",         region_name=region)
         self.redshift = boto3.client("redshift",      region_name=region)
         self.ecr      = boto3.client("ecr",           region_name=region)
+        # IAM is a global service — region_name only affects request signing,
+        # not what account the role/profile lives in.
+        self.iam      = boto3.client("iam",           region_name=region)
 
         self._collected_kp_names = []
 
@@ -1066,6 +1069,56 @@ class AWSCleaner(BaseCleaner):
             details.append(f"error: {exc}")
         self._finalize(30, "Transit Gateways", details)
 
+    def step31_spoke_ssm_role(self):
+        """Delete the leftover 'aws-spoke-ec2-ssm' IAM role/instance-profile
+        used by lab spoke EC2 instances for SSM access. IAM is a global
+        resource, not scoped to self.region, and nothing else in this
+        cleaner ever touches IAM — so it outlives EC2 instance termination
+        (step3_ec2) with no other step cleaning it up. In an all-regions
+        fan-out, every region worker calls this once on the same global
+        role; a losing racer's NoSuchEntity is treated as already-gone,
+        not an error."""
+        self._emit(31, "Spoke EC2 SSM IAM Role", "running")
+        details = []
+        role_name    = "aws-spoke-ec2-ssm-role"
+        profile_name = "aws-spoke-ec2-ssm-profile"
+        try:
+            self.iam.get_role(RoleName=role_name)
+        except self.iam.exceptions.NoSuchEntityException:
+            self._finalize(31, "Spoke EC2 SSM IAM Role", ["none found"])
+            return
+        except Exception as exc:
+            self._finalize(31, "Spoke EC2 SSM IAM Role", [f"error: {exc}"])
+            return
+
+        if self.dry_run:
+            self._finalize(31, "Spoke EC2 SSM IAM Role",
+                [f"[DRY-RUN] would delete: IAM role {role_name} and instance profile {profile_name}"])
+            return
+
+        try:
+            try:
+                self.iam.remove_role_from_instance_profile(
+                    InstanceProfileName=profile_name, RoleName=role_name)
+            except self.iam.exceptions.NoSuchEntityException:
+                pass
+            try:
+                self.iam.delete_instance_profile(InstanceProfileName=profile_name)
+                details.append(f"deleted: instance profile {profile_name}")
+            except self.iam.exceptions.NoSuchEntityException:
+                details.append(f"already gone: instance profile {profile_name}")
+
+            for p in self.iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies", []):
+                self.iam.detach_role_policy(RoleName=role_name, PolicyArn=p["PolicyArn"])
+            try:
+                self.iam.delete_role(RoleName=role_name)
+                details.append(f"deleted: IAM role {role_name}")
+            except self.iam.exceptions.NoSuchEntityException:
+                details.append(f"already gone: IAM role {role_name}")
+        except Exception as exc:
+            details.append(f"error: {exc}")
+        self._finalize(31, "Spoke EC2 SSM IAM Role", details)
+
     def run(self):
         vpcs = self._vpc_list()
         if vpcs is None:
@@ -1105,3 +1158,4 @@ class AWSCleaner(BaseCleaner):
             self.step28_key_pairs()
             self.step29_subnet_groups()
         self.step30_transit_gateways()
+        self.step31_spoke_ssm_role()

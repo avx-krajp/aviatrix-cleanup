@@ -516,6 +516,20 @@ Resources:
                 - ecr:DeleteRepository
 
               Resource: "*"
+        - Statement:
+            # ── IAM — leftover spoke EC2 SSM role/profile only, never wildcard ──
+            - Effect: Allow
+              Action:
+                - iam:GetRole
+                - iam:DeleteRole
+                - iam:ListAttachedRolePolicies
+                - iam:DetachRolePolicy
+              Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-spoke-ec2-ssm-role"
+            - Effect: Allow
+              Action:
+                - iam:RemoveRoleFromInstanceProfile
+                - iam:DeleteInstanceProfile
+              Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/aws-spoke-ec2-ssm-profile"
 
   # ── Web bucket — private; only CloudFront can read ─────────────────────────
   WebBucket:
