@@ -392,7 +392,7 @@ Resources:
             Auth:
               Authorizer: CookieAuthorizer
 
-  # ── Worker Lambda — long-running cleanup (27 AWS / 26 Azure / 14 GCP steps) ─
+  # ── Worker Lambda — long-running cleanup (30 AWS / 26 Azure / 14 GCP steps) ─
   # The Azure SDK layer is pinned via AzureSdkLayerArn — SAM never rebuilds it.
   # google-auth for GCP is bundled in the function zip via lambda/requirements.txt.
   CleanupWorkerFunction:
@@ -434,6 +434,10 @@ Resources:
                 - ec2:DeleteTransitGateway
                 - ec2:DeleteInstanceConnectEndpoint
                 - ec2:DescribeInstanceConnectEndpoints
+                - ec2:DeleteVpcPeeringConnection
+                - ec2:DetachVpnGateway
+                - ec2:DeleteVpnGateway
+                - ec2:DeleteVpnConnection
                 - ec2:DeleteVpc
                 - ec2:DeleteSubnet
                 - ec2:DeleteInternetGateway

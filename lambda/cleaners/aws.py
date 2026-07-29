@@ -1,5 +1,5 @@
 """
-aws.py — AWSCleaner (mirrors lib/aws_cleanup.sh — 28 steps)
+aws.py — AWSCleaner (mirrors lib/aws_cleanup.sh — 30 steps)
 """
 
 import time
@@ -10,7 +10,7 @@ from job_store import update_job, step_record
 
 
 class AWSCleaner(BaseCleaner):
-    TOTAL = 28
+    TOTAL = 30
 
     def __init__(self, region: str, vpc_id: str, dry_run: bool,
                  table, job_id: str):
@@ -594,8 +594,100 @@ class AWSCleaner(BaseCleaner):
             details.append(f"error: {exc}")
         self._finalize(14, "VPC Endpoints", details)
 
-    def step15_eni(self):
-        self._emit(15, "Network Interfaces (ENIs)", "running")
+    def step15_vpc_peering(self):
+        self._emit(15, "VPC Peering Connections", "running")
+        details = []
+        try:
+            # A VPC with any active/pending peering connection (as either
+            # requester or accepter) can't be deleted — DeleteVpc fails with
+            # DependencyViolation. Delete before ENI cleanup for consistency
+            # with the other cross-VPC dependencies handled here, even
+            # though peering itself doesn't hold an ENI.
+            conns = self.ec2.describe_vpc_peering_connections(
+                Filters=[
+                    {"Name": "requester-vpc-info.vpc-id", "Values": [self.vpc_id]},
+                ]
+            )["VpcPeeringConnections"]
+            conns += self.ec2.describe_vpc_peering_connections(
+                Filters=[
+                    {"Name": "accepter-vpc-info.vpc-id", "Values": [self.vpc_id]},
+                ]
+            )["VpcPeeringConnections"]
+            seen = set()
+            conn_ids = []
+            for c in conns:
+                cid = c["VpcPeeringConnectionId"]
+                if cid in seen or c.get("Status", {}).get("Code") in ("deleted", "deleting"):
+                    continue
+                seen.add(cid)
+                details.append(self._delete(f"VPC peering connection {cid}",
+                    self.ec2.delete_vpc_peering_connection, VpcPeeringConnectionId=cid))
+                conn_ids.append(cid)
+            if conn_ids:
+                cleared = self._poll_until_gone(
+                    lambda: bool(self.ec2.describe_vpc_peering_connections(
+                        Filters=[
+                            {"Name": "vpc-peering-connection-id", "Values": conn_ids},
+                            {"Name": "status-code", "Values": ["deleting"]},
+                        ]
+                    ).get("VpcPeeringConnections", [])),
+                    max_wait=120, interval=10)
+                if not cleared:
+                    details.append(f"warn: VPC peering connections {conn_ids} still deleting after wait")
+        except Exception as exc:
+            details.append(f"error: {exc}")
+        self._finalize(15, "VPC Peering Connections", details)
+
+    def step16_vpn_gateways(self):
+        self._emit(16, "VPN Gateways", "running")
+        details = []
+        try:
+            # A Virtual Private Gateway attached to the VPC (Site-to-Site
+            # VPN) blocks DeleteVpc the same way an IGW does — detach then
+            # delete. Delete any VPN Connections on the gateway first, since
+            # AWS won't detach/delete a VGW that still has active tunnels.
+            vgws = self.ec2.describe_vpn_gateways(
+                Filters=[
+                    {"Name": "attachment.vpc-id", "Values": [self.vpc_id]},
+                    {"Name": "state", "Values": ["available", "pending"]},
+                ]
+            )["VpnGateways"]
+            for vgw in vgws:
+                vgwid = vgw["VpnGatewayId"]
+                conns = self.ec2.describe_vpn_connections(
+                    Filters=[
+                        {"Name": "vpn-gateway-id", "Values": [vgwid]},
+                        {"Name": "state", "Values": ["available", "pending"]},
+                    ]
+                )["VpnConnections"]
+                conn_ids = [c["VpnConnectionId"] for c in conns]
+                for cid in conn_ids:
+                    details.append(self._delete(f"VPN connection {cid}",
+                        self.ec2.delete_vpn_connection, VpnConnectionId=cid))
+                if conn_ids:
+                    cleared = self._poll_until_gone(
+                        lambda: bool(self.ec2.describe_vpn_connections(
+                            Filters=[
+                                {"Name": "vpn-connection-id", "Values": conn_ids},
+                                {"Name": "state", "Values": ["deleting"]},
+                            ]
+                        ).get("VpnConnections", [])),
+                        max_wait=120, interval=10)
+                    if not cleared:
+                        details.append(f"warn: VPN connections {conn_ids} still deleting after wait")
+                if not self.dry_run:
+                    try:
+                        self.ec2.detach_vpn_gateway(VpnGatewayId=vgwid, VpcId=self.vpc_id)
+                    except Exception as exc:
+                        details.append(f"warn detaching VGW {vgwid}: {exc}")
+                details.append(self._delete(f"VPN gateway {vgwid}",
+                    self.ec2.delete_vpn_gateway, VpnGatewayId=vgwid))
+        except Exception as exc:
+            details.append(f"error: {exc}")
+        self._finalize(16, "VPN Gateways", details)
+
+    def step17_eni(self):
+        self._emit(17, "Network Interfaces (ENIs)", "running")
         details = []
         try:
             # GuardDuty Runtime Monitoring attaches managed ENIs (owned by
@@ -720,10 +812,10 @@ class AWSCleaner(BaseCleaner):
                     self.ec2.delete_network_interface, NetworkInterfaceId=eid))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(15, "Network Interfaces (ENIs)", details)
+        self._finalize(17, "Network Interfaces (ENIs)", details)
 
-    def step16_eip(self):
-        self._emit(16, "Elastic IPs", "running")
+    def step18_eip(self):
+        self._emit(18, "Elastic IPs", "running")
         details = []
         try:
             addrs = self.ec2.describe_addresses(
@@ -738,10 +830,10 @@ class AWSCleaner(BaseCleaner):
                             self.ec2.release_address, AllocationId=alloc_id))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(16, "Elastic IPs", details)
+        self._finalize(18, "Elastic IPs", details)
 
-    def step17_security_groups(self):
-        self._emit(17, "Security Groups", "running")
+    def step19_security_groups(self):
+        self._emit(19, "Security Groups", "running")
         details = []
         try:
             sgs = self._paginated(self.ec2, "describe_security_groups", "SecurityGroups",
@@ -766,10 +858,10 @@ class AWSCleaner(BaseCleaner):
                     self.ec2.delete_security_group, GroupId=sgid))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(17, "Security Groups", details)
+        self._finalize(19, "Security Groups", details)
 
-    def step18_nacls(self):
-        self._emit(18, "Network ACLs", "running")
+    def step20_nacls(self):
+        self._emit(20, "Network ACLs", "running")
         details = []
         try:
             nacls = self.ec2.describe_network_acls(
@@ -783,10 +875,10 @@ class AWSCleaner(BaseCleaner):
                     self.ec2.delete_network_acl, NetworkAclId=nid))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(18, "Network ACLs", details)
+        self._finalize(20, "Network ACLs", details)
 
-    def step19_route_tables(self):
-        self._emit(19, "Route Tables", "running")
+    def step21_route_tables(self):
+        self._emit(21, "Route Tables", "running")
         details = []
         try:
             rts = self._paginated(self.ec2, "describe_route_tables", "RouteTables",
@@ -806,10 +898,10 @@ class AWSCleaner(BaseCleaner):
                     self.ec2.delete_route_table, RouteTableId=rtid))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(19, "Route Tables", details)
+        self._finalize(21, "Route Tables", details)
 
-    def step20_subnets(self):
-        self._emit(20, "Subnets", "running")
+    def step22_subnets(self):
+        self._emit(22, "Subnets", "running")
         details = []
         try:
             subnets = self.ec2.describe_subnets(
@@ -821,10 +913,10 @@ class AWSCleaner(BaseCleaner):
                     self.ec2.delete_subnet, SubnetId=sid))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(20, "Subnets", details)
+        self._finalize(22, "Subnets", details)
 
-    def step21_igw(self):
-        self._emit(21, "Internet Gateways", "running")
+    def step23_igw(self):
+        self._emit(23, "Internet Gateways", "running")
         details = []
         try:
             igws = self.ec2.describe_internet_gateways(
@@ -839,20 +931,20 @@ class AWSCleaner(BaseCleaner):
                     self.ec2.delete_internet_gateway, InternetGatewayId=igwid))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(21, "Internet Gateways", details)
+        self._finalize(23, "Internet Gateways", details)
 
-    def step22_vpc(self):
-        self._emit(22, "VPC", "running")
+    def step24_vpc(self):
+        self._emit(24, "VPC", "running")
         details = []
         try:
             details.append(self._delete(f"VPC {self.vpc_id}",
                 self.ec2.delete_vpc, VpcId=self.vpc_id))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(22, "VPC", details)
+        self._finalize(24, "VPC", details)
 
-    def step23_snapshots(self):
-        self._emit(23, "EBS Snapshots (owned by account)", "running")
+    def step25_snapshots(self):
+        self._emit(25, "EBS Snapshots (owned by account)", "running")
         details = []
         try:
             snaps = self._paginated(self.ec2, "describe_snapshots", "Snapshots",
@@ -863,10 +955,10 @@ class AWSCleaner(BaseCleaner):
                     self.ec2.delete_snapshot, SnapshotId=sid))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(23, "EBS Snapshots", details)
+        self._finalize(25, "EBS Snapshots", details)
 
-    def step24_amis(self):
-        self._emit(24, "AMIs (owned by account)", "running")
+    def step26_amis(self):
+        self._emit(26, "AMIs (owned by account)", "running")
         details = []
         try:
             images = self._paginated(self.ec2, "describe_images", "Images",
@@ -877,10 +969,10 @@ class AWSCleaner(BaseCleaner):
                     self.ec2.deregister_image, ImageId=iid))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(24, "AMIs", details)
+        self._finalize(26, "AMIs", details)
 
-    def step25_ecr(self):
-        self._emit(25, "ECR Repositories", "running")
+    def step27_ecr(self):
+        self._emit(27, "ECR Repositories", "running")
         details = []
         try:
             repos = self.ecr.describe_repositories()["repositories"]
@@ -891,10 +983,10 @@ class AWSCleaner(BaseCleaner):
                     repositoryName=name, force=True))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(25, "ECR Repositories", details)
+        self._finalize(27, "ECR Repositories", details)
 
-    def step26_key_pairs(self):
-        self._emit(26, "Key Pairs", "running")
+    def step28_key_pairs(self):
+        self._emit(28, "Key Pairs", "running")
         details = []
         try:
             for kp_name in set(self._collected_kp_names):
@@ -902,11 +994,11 @@ class AWSCleaner(BaseCleaner):
                     self.ec2.delete_key_pair, KeyName=kp_name))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(26, "Key Pairs", details)
+        self._finalize(28, "Key Pairs", details)
 
-    def step27_subnet_groups(self):
+    def step29_subnet_groups(self):
         """Delete orphaned DB / cache subnet groups."""
-        self._emit(27, "Orphaned Subnet Groups", "running")
+        self._emit(29, "Orphaned Subnet Groups", "running")
         details = []
         try:
             for sg in self.rds.describe_db_subnet_groups()["DBSubnetGroups"]:
@@ -923,19 +1015,20 @@ class AWSCleaner(BaseCleaner):
                         CacheSubnetGroupName=sg["CacheSubnetGroupName"]))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(27, "Orphaned Subnet Groups", details)
+        self._finalize(29, "Orphaned Subnet Groups", details)
 
-    def step28_transit_gateways(self):
+    def step30_transit_gateways(self):
         """Delete Aviatrix-created Transit Gateways once they have no
         remaining attachments. TGW is a region-level resource (not scoped
         to a single VPC), so this runs once per region after all VPCs have
         been processed rather than inside the per-VPC loop."""
-        self._emit(28, "Transit Gateways", "running")
+        self._emit(30, "Transit Gateways", "running")
         details = []
         try:
             tgws = self.ec2.describe_transit_gateways(
                 Filters=[{"Name": "state", "Values": ["available", "pending", "modifying"]}]
             ).get("TransitGateways", [])
+            tgw_ids = []
             for tgw in tgws:
                 tags = {t["Key"]: t["Value"] for t in tgw.get("Tags", [])}
                 is_avx = any("aviatrix" in k.lower() or "aviatrix" in v.lower()
@@ -957,9 +1050,21 @@ class AWSCleaner(BaseCleaner):
                     continue
                 details.append(self._delete(f"Transit Gateway {tid}",
                     self.ec2.delete_transit_gateway, TransitGatewayId=tid))
+                tgw_ids.append(tid)
+            if tgw_ids:
+                cleared = self._poll_until_gone(
+                    lambda: bool(self.ec2.describe_transit_gateways(
+                        Filters=[
+                            {"Name": "transit-gateway-id", "Values": tgw_ids},
+                            {"Name": "state", "Values": ["deleting"]},
+                        ]
+                    ).get("TransitGateways", [])),
+                    max_wait=300, interval=15)
+                if not cleared:
+                    details.append(f"warn: Transit Gateways {tgw_ids} still deleting after wait")
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(28, "Transit Gateways", details)
+        self._finalize(30, "Transit Gateways", details)
 
     def run(self):
         vpcs = self._vpc_list()
@@ -984,17 +1089,19 @@ class AWSCleaner(BaseCleaner):
             self.step12_alb()
             self.step13_target_groups()
             self.step14_vpc_endpoints()
-            self.step15_eni()
-            self.step16_eip()
-            self.step17_security_groups()
-            self.step18_nacls()
-            self.step19_route_tables()
-            self.step20_subnets()
-            self.step21_igw()
-            self.step22_vpc()
-            self.step23_snapshots()
-            self.step24_amis()
-            self.step25_ecr()
-            self.step26_key_pairs()
-            self.step27_subnet_groups()
-        self.step28_transit_gateways()
+            self.step15_vpc_peering()
+            self.step16_vpn_gateways()
+            self.step17_eni()
+            self.step18_eip()
+            self.step19_security_groups()
+            self.step20_nacls()
+            self.step21_route_tables()
+            self.step22_subnets()
+            self.step23_igw()
+            self.step24_vpc()
+            self.step25_snapshots()
+            self.step26_amis()
+            self.step27_ecr()
+            self.step28_key_pairs()
+            self.step29_subnet_groups()
+        self.step30_transit_gateways()

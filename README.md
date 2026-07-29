@@ -32,7 +32,7 @@ CloudFront  ──── static files ────►  S3 (web/)
                                cleanup job)                          (daily stop)
                                         │
                               lambda/cleaners/
-                              ├── aws.py    (28 steps)
+                              ├── aws.py    (30 steps)
                               ├── azure.py  (26 steps)
                               └── gcp.py    (14 steps)
 ```
