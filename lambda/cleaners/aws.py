@@ -354,8 +354,87 @@ class AWSCleaner(BaseCleaner):
             details.append(f"error: {exc}")
         self._finalize(11, "EBS Volumes", details)
 
-    def step12_eni(self):
-        self._emit(12, "Network Interfaces (ENIs)", "running")
+    def step12_alb(self):
+        self._emit(12, "ALBs / NLBs / Classic ELBs", "running")
+        details = []
+        try:
+            # Runs before ENI cleanup — an ALB/NLB owns its own ENIs
+            # ("ELB net interface") that AWS refuses to force-delete directly
+            # ("currently in use"); only deleting the load balancer itself
+            # releases them.
+            lbs = self.elbv2.describe_load_balancers()["LoadBalancers"]
+            for lb in lbs:
+                if lb.get("VpcId") == self.vpc_id:
+                    arn = lb["LoadBalancerArn"]
+                    # delete listeners first
+                    listeners = self.elbv2.describe_listeners(
+                        LoadBalancerArn=arn)["Listeners"]
+                    for l_ in listeners:
+                        self._delete(f"listener {l_['ListenerArn']}",
+                            self.elbv2.delete_listener,
+                            ListenerArn=l_["ListenerArn"])
+                    details.append(self._delete(f"LB {arn}",
+                        self.elbv2.delete_load_balancer, LoadBalancerArn=arn))
+            # Classic ELBs
+            classic = self.elb.describe_load_balancers()["LoadBalancerDescriptions"]
+            for c in classic:
+                if c.get("VPCId") == self.vpc_id:
+                    name = c["LoadBalancerName"]
+                    details.append(self._delete(f"Classic ELB {name}",
+                        self.elb.delete_load_balancer, LoadBalancerName=name))
+        except Exception as exc:
+            details.append(f"error: {exc}")
+        self._finalize(12, "ALBs / NLBs / Classic ELBs", details)
+
+    def step13_target_groups(self):
+        self._emit(13, "Target Groups", "running")
+        details = []
+        try:
+            tgs = self.elbv2.describe_target_groups()["TargetGroups"]
+            for tg in tgs:
+                if tg.get("VpcId") == self.vpc_id:
+                    arn = tg["TargetGroupArn"]
+                    details.append(self._delete(f"target-group {arn}",
+                        self.elbv2.delete_target_group, TargetGroupArn=arn))
+        except Exception as exc:
+            details.append(f"error: {exc}")
+        self._finalize(13, "Target Groups", details)
+
+    def step14_vpc_endpoints(self):
+        self._emit(14, "VPC Endpoints", "running")
+        details = []
+        try:
+            # Runs before ENI cleanup — an Interface-type VPC Endpoint owns
+            # its own ENIs, which AWS refuses to force-delete directly
+            # ("currently in use"); only deleting the endpoint releases them,
+            # and that's async (state goes to 'deleting', not instantly
+            # 'deleted'), so wait for it here rather than letting the race
+            # resurface one step later in ENI cleanup.
+            eps = self.ec2.describe_vpc_endpoints(
+                Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}]
+            )["VpcEndpoints"]
+            ids = [ep["VpcEndpointId"] for ep in eps
+                   if ep["State"] not in ("deleted", "deleting")]
+            if ids:
+                details.append(self._delete(f"VPC endpoints {ids}",
+                    self.ec2.delete_vpc_endpoints, VpcEndpointIds=ids))
+                if not self.dry_run:
+                    for _ in range(18):   # up to 90s (18 × 5s)
+                        time.sleep(5)
+                        remaining = self.ec2.describe_vpc_endpoints(
+                            Filters=[
+                                {"Name": "vpc-id", "Values": [self.vpc_id]},
+                                {"Name": "vpc-endpoint-state", "Values": ["deleting"]},
+                            ]
+                        ).get("VpcEndpoints", [])
+                        if not remaining:
+                            break
+        except Exception as exc:
+            details.append(f"error: {exc}")
+        self._finalize(14, "VPC Endpoints", details)
+
+    def step15_eni(self):
+        self._emit(15, "Network Interfaces (ENIs)", "running")
         details = []
         try:
             # GuardDuty Runtime Monitoring attaches managed ENIs (owned by
@@ -480,10 +559,10 @@ class AWSCleaner(BaseCleaner):
                     self.ec2.delete_network_interface, NetworkInterfaceId=eid))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(12, "Network Interfaces (ENIs)", details)
+        self._finalize(15, "Network Interfaces (ENIs)", details)
 
-    def step13_eip(self):
-        self._emit(13, "Elastic IPs", "running")
+    def step16_eip(self):
+        self._emit(16, "Elastic IPs", "running")
         details = []
         try:
             addrs = self.ec2.describe_addresses(
@@ -498,66 +577,7 @@ class AWSCleaner(BaseCleaner):
                             self.ec2.release_address, AllocationId=alloc_id))
         except Exception as exc:
             details.append(f"error: {exc}")
-        self._finalize(13, "Elastic IPs", details)
-
-    def step14_alb(self):
-        self._emit(14, "ALBs / NLBs / Classic ELBs", "running")
-        details = []
-        try:
-            # ALB / NLB
-            lbs = self.elbv2.describe_load_balancers()["LoadBalancers"]
-            for lb in lbs:
-                if lb.get("VpcId") == self.vpc_id:
-                    arn = lb["LoadBalancerArn"]
-                    # delete listeners first
-                    listeners = self.elbv2.describe_listeners(
-                        LoadBalancerArn=arn)["Listeners"]
-                    for l_ in listeners:
-                        self._delete(f"listener {l_['ListenerArn']}",
-                            self.elbv2.delete_listener,
-                            ListenerArn=l_["ListenerArn"])
-                    details.append(self._delete(f"LB {arn}",
-                        self.elbv2.delete_load_balancer, LoadBalancerArn=arn))
-            # Classic ELBs
-            classic = self.elb.describe_load_balancers()["LoadBalancerDescriptions"]
-            for c in classic:
-                if c.get("VPCId") == self.vpc_id:
-                    name = c["LoadBalancerName"]
-                    details.append(self._delete(f"Classic ELB {name}",
-                        self.elb.delete_load_balancer, LoadBalancerName=name))
-        except Exception as exc:
-            details.append(f"error: {exc}")
-        self._finalize(14, "ALBs / NLBs / Classic ELBs", details)
-
-    def step15_target_groups(self):
-        self._emit(15, "Target Groups", "running")
-        details = []
-        try:
-            tgs = self.elbv2.describe_target_groups()["TargetGroups"]
-            for tg in tgs:
-                if tg.get("VpcId") == self.vpc_id:
-                    arn = tg["TargetGroupArn"]
-                    details.append(self._delete(f"target-group {arn}",
-                        self.elbv2.delete_target_group, TargetGroupArn=arn))
-        except Exception as exc:
-            details.append(f"error: {exc}")
-        self._finalize(15, "Target Groups", details)
-
-    def step16_vpc_endpoints(self):
-        self._emit(16, "VPC Endpoints", "running")
-        details = []
-        try:
-            eps = self.ec2.describe_vpc_endpoints(
-                Filters=[{"Name": "vpc-id", "Values": [self.vpc_id]}]
-            )["VpcEndpoints"]
-            ids = [ep["VpcEndpointId"] for ep in eps
-                   if ep["State"] not in ("deleted", "deleting")]
-            if ids:
-                details.append(self._delete(f"VPC endpoints {ids}",
-                    self.ec2.delete_vpc_endpoints, VpcEndpointIds=ids))
-        except Exception as exc:
-            details.append(f"error: {exc}")
-        self._finalize(16, "VPC Endpoints", details)
+        self._finalize(16, "Elastic IPs", details)
 
     def step17_security_groups(self):
         self._emit(17, "Security Groups", "running")
@@ -800,11 +820,11 @@ class AWSCleaner(BaseCleaner):
             self.step9_msk()
             self.step10_redshift()
             self.step11_ebs()
-            self.step12_eni()
-            self.step13_eip()
-            self.step14_alb()
-            self.step15_target_groups()
-            self.step16_vpc_endpoints()
+            self.step12_alb()
+            self.step13_target_groups()
+            self.step14_vpc_endpoints()
+            self.step15_eni()
+            self.step16_eip()
             self.step17_security_groups()
             self.step18_nacls()
             self.step19_route_tables()
