@@ -5,14 +5,17 @@
 # `sam delete` alone fails here: CloudFormation refuses to delete a non-empty
 # S3 bucket, and this stack's web bucket always has files in it after deploy.
 # There's also state that isn't a stack resource at all (the EventBridge
-# schedule created imperatively by the app, and the Azure layer staging
-# bucket created by setup/deploy.sh) that sam delete never touches.
+# schedule created imperatively by the app, the Azure layer staging bucket,
+# and the Azure/GCP credential secrets — all created imperatively by
+# setup/deploy.sh via `aws secretsmanager create-secret`, so CloudFormation
+# has no record of them) that sam delete never touches.
 #
 # This script does the full sequence so nobody has to remember it by hand:
 #   1. Delete the EventBridge Scheduler entry, if one was ever created.
 #   2. Empty (then let sam delete remove) the web bucket.
 #   3. Remove the Azure layer staging bucket, if one was created.
-#   4. Run sam delete.
+#   4. Delete the Azure/GCP credential secrets, if any were created.
+#   5. Run sam delete.
 # =============================================================================
 set -euo pipefail
 
@@ -74,6 +77,17 @@ if aws s3api head-bucket --bucket "$LAYER_STAGING_BUCKET" --region "$REGION" >/d
 else
   ok "Bucket $LAYER_STAGING_BUCKET not found — nothing to do"
 fi
+
+step "Deleting credential secrets (if any)"
+for SECRET_NAME in "${RESOURCE_PREFIX}aviatrix-cleanup/azure-sp" "${RESOURCE_PREFIX}aviatrix-cleanup/gcp-sa"; do
+  if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --region "$REGION" >/dev/null 2>&1; then
+    aws secretsmanager delete-secret --secret-id "$SECRET_NAME" --region "$REGION" \
+      --force-delete-without-recovery >/dev/null
+    ok "Deleted secret $SECRET_NAME"
+  else
+    ok "Secret $SECRET_NAME not found — nothing to do"
+  fi
+done
 
 step "Deleting CloudFormation stack"
 if [ ! -f "$CONFIG_FILE" ]; then
