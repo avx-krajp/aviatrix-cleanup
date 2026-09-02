@@ -693,38 +693,40 @@ class AWSCleaner(BaseCleaner):
         self._emit(17, "Network Interfaces (ENIs)", "running")
         details = []
         try:
-            # GuardDuty Runtime Monitoring attaches managed ENIs (owned by
-            # "amazon-aws") while EC2 instances are running in the VPC. Once
-            # all instances are terminated (step 3 already waited for that),
-            # GuardDuty retracts its ENIs automatically — but it can take a
-            # few minutes. Poll here (up to 5 min) before trying to delete;
-            # if they haven't gone by then, log a warning and continue anyway
-            # so the remaining steps record the real error.
-            def _gd_enis():
-                return [
-                    e for e in self.ec2.describe_network_interfaces(
-                        Filters=[
-                            {"Name": "vpc-id",                           "Values": [self.vpc_id]},
-                            {"Name": "attachment.instance-owner-id",     "Values": ["amazon-aws"]},
-                        ]
-                    )["NetworkInterfaces"]
-                    if "guardduty" in e.get("Description", "").lower()
-                ]
+            # ENIs owned by "amazon-aws" (GuardDuty Runtime Monitoring, VPC
+            # Interface Endpoints, etc.) are never detached below — AWS
+            # manages their attachment lifecycle itself, and a forced detach
+            # either fails or just gets re-attached. They self-release
+            # asynchronously: GuardDuty ENIs once EC2 instances are gone
+            # (step 3 already waited for that), endpoint ENIs once the
+            # endpoint object itself is deleted (step 14 already waited for
+            # that object's state, but the ENI behind it can outlive it by a
+            # bit longer). Poll here (up to 5 min) before trying to delete
+            # any of them; if they haven't gone by then, log a warning and
+            # continue anyway so the remaining steps record the real error.
+            def _aws_owned_enis():
+                return self.ec2.describe_network_interfaces(
+                    Filters=[
+                        {"Name": "vpc-id",                       "Values": [self.vpc_id]},
+                        {"Name": "attachment.instance-owner-id", "Values": ["amazon-aws"]},
+                        {"Name": "status",                       "Values": ["in-use"]},
+                    ]
+                )["NetworkInterfaces"]
             if not self.dry_run:
-                pending = _gd_enis()
+                pending = _aws_owned_enis()
                 if pending:
                     ids_str = ", ".join(e["NetworkInterfaceId"] for e in pending)
-                    details.append(f"waiting for GuardDuty to retract ENIs: {ids_str}")
+                    details.append(f"waiting for AWS-managed ENIs to retract: {ids_str}")
                     for _ in range(30):   # up to 5 minutes (30 × 10 s)
                         time.sleep(10)
-                        if not _gd_enis():
-                            details.append("GuardDuty ENIs retracted")
+                        if not _aws_owned_enis():
+                            details.append("AWS-managed ENIs retracted")
                             break
                     else:
-                        remaining = _gd_enis()
+                        remaining = _aws_owned_enis()
                         if remaining:
                             ids_str = ", ".join(e["NetworkInterfaceId"] for e in remaining)
-                            details.append(f"warn: GuardDuty ENIs still present after wait: {ids_str}")
+                            details.append(f"warn: AWS-managed ENIs still present after wait: {ids_str}")
 
             # Delete EC2 Instance Connect Endpoints — they hold
             # 'ec2_instance_connect_endpoint' ENIs that block subnet/VPC deletion.
