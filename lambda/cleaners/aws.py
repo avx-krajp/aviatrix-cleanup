@@ -1110,8 +1110,17 @@ class AWSCleaner(BaseCleaner):
             except self.iam.exceptions.NoSuchEntityException:
                 details.append(f"already gone: instance profile {profile_name}")
 
-            for p in self.iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies", []):
-                self.iam.detach_role_policy(RoleName=role_name, PolicyArn=p["PolicyArn"])
+            try:
+                policies = self.iam.list_attached_role_policies(
+                    RoleName=role_name).get("AttachedPolicies", [])
+                for p in policies:
+                    try:
+                        self.iam.detach_role_policy(
+                            RoleName=role_name, PolicyArn=p["PolicyArn"])
+                    except self.iam.exceptions.NoSuchEntityException:
+                        pass  # a concurrent region worker already detached it
+            except self.iam.exceptions.NoSuchEntityException:
+                pass  # a concurrent region worker already deleted the role
             try:
                 self.iam.delete_role(RoleName=role_name)
                 details.append(f"deleted: IAM role {role_name}")
