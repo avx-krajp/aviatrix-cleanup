@@ -68,11 +68,15 @@ Parameters:
       "ANTHROPIC_DEFAULT_SONNET_MODEL": "...", "BEDROCK_REGION": "..."}).
       Leave blank to disable the Deploy feature.
   DeployRunnerAmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Type: String
+    Default: ami-07a5b367e8dc8bd92
     Description: >
-      AMI for the Deploy runner EC2 instance. Defaults to the latest Amazon
-      Linux 2023 image, resolved at deploy time via SSM.
+      AMI for the Deploy runner EC2 instance. Pinned explicitly (not resolved
+      via the "latest Amazon Linux" SSM alias) because the runner is a
+      stateful instance -- resolving "latest" on every deploy would silently
+      terminate and recreate it (losing local state) whenever AWS publishes a
+      newer AL2023 AMI, even on deploys that only touch Lambda code. Bump this
+      deliberately when you want to roll the runner onto a newer AMI.
 
 # ── Conditions ────────────────────────────────────────────────────────────────
 Conditions:

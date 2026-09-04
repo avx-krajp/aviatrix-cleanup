@@ -14,5 +14,5 @@ resolve_s3      = true
 capabilities    = "CAPABILITY_IAM"
 confirm_changeset = true
 s3_prefix = "aviatrix-cleanup"
-parameter_overrides = "StageName=\"prod\""
+parameter_overrides = "StageName=\"prod\" DeployRunnerAmiId=\"ami-07a5b367e8dc8bd92\""
 image_repositories = []
