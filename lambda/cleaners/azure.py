@@ -5,7 +5,7 @@ azure.py — AzureCleaner (mirrors lib/azure_cleanup.sh — 22 per-RG steps + 4 
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .base import BaseCleaner
+from .base import BaseCleaner, CSP_IGNORE_KEY, CSP_IGNORE_VALUE
 
 
 class AzureCleaner(BaseCleaner):
@@ -121,6 +121,24 @@ class AzureCleaner(BaseCleaner):
             if any("aviatrix" in k for k in tag_keys_lower) or name_lower.startswith("avx-"):
                 out.append(rg)
         return out
+
+    def _rg_protected_reason(self, rg) -> str | None:
+        """Return a reason string if this resource group (or any VM inside
+        it) is tagged csp-cost-ignore=yes, else None. Azure RG deletion
+        (step22) cascades to remove every resource inside regardless of
+        which per-resource steps ran earlier, so per-VM skips alone can't
+        protect a gateway/controller — only skipping the whole RG can."""
+        if self._is_ignore_tag(rg.tags):
+            return f"resource group tagged {CSP_IGNORE_KEY}={CSP_IGNORE_VALUE}"
+        try:
+            names = [vm.name for vm in self.compute.virtual_machines.list(rg.name)
+                     if self._is_ignore_tag(vm.tags)]
+            if names:
+                return (f"protected VM(s) tagged "
+                        f"{CSP_IGNORE_KEY}={CSP_IGNORE_VALUE}: {names}")
+        except Exception as exc:
+            return f"error checking {CSP_IGNORE_KEY} tag: {exc}"
+        return None
 
     def _vnets(self, rg_name: str) -> list[str]:
         try:
@@ -638,6 +656,11 @@ class AzureCleaner(BaseCleaner):
 
         for rg in rgs:
             name = rg.name
+            reason = self._rg_protected_reason(rg)
+            if reason:
+                self._emit(1, f"Resource Group {name} — protected, skipping",
+                           "skipped", reason)
+                continue
             self.step1_locks(name)
             self.step2_aks(name)
             self.step3_vmss(name)

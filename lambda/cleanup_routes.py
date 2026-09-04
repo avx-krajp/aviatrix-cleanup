@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from regions import ALL_AWS_REGIONS, ALL_AZURE_REGIONS, ALL_GCP_REGIONS
 import instances_routes
+import deploy_routes
 
 REGION              = os.environ.get("AWS_REGION", "us-east-1")
 TABLE_NAME          = os.environ.get("CLEANUP_TABLE", "aviatrix-cleanup-jobs")
@@ -380,6 +381,10 @@ def handler(event: dict, _context) -> dict:
         return instances_routes.route("start-all", event)
     if route_key == "POST /api/instances/stop-all":
         return instances_routes.route("stop-all", event)
+    if route_key == "POST /api/deploy":
+        return deploy_routes.route("start", event)
+    if route_key.startswith("GET /api/deploy/status"):
+        return deploy_routes.route("status", event)
 
     http_ctx = (event.get("requestContext") or {}).get("http") or {}
     method = event.get("httpMethod") or http_ctx.get("method", "")
@@ -411,5 +416,9 @@ def handler(event: dict, _context) -> dict:
         return instances_routes.route("start-all", event)
     if method == "POST" and p == "/api/instances/stop-all":
         return instances_routes.route("stop-all", event)
+    if method == "POST" and p == "/api/deploy":
+        return deploy_routes.route("start", event)
+    if method == "GET" and "/api/deploy/status" in path:
+        return deploy_routes.route("status", event)
 
     return _resp(404, {"error": f"No route for {method} {path}"})

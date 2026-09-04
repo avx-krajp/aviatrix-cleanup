@@ -5,7 +5,7 @@ aws.py — AWSCleaner (mirrors lib/aws_cleanup.sh — 31 steps)
 import time
 import boto3
 
-from .base import BaseCleaner
+from .base import BaseCleaner, CSP_IGNORE_KEY, CSP_IGNORE_VALUE
 from job_store import update_job, step_record
 
 
@@ -86,6 +86,33 @@ class AWSCleaner(BaseCleaner):
                 return False
             time.sleep(interval)
             elapsed += interval
+
+    def _vpc_protected_reason(self, vpc_id: str) -> str | None:
+        """Return a reason string if any EC2 instance in this VPC is tagged
+        csp-cost-ignore=yes, else None. Checked before any deletion in the
+        VPC — Aviatrix gateways/controllers are EC2 instances, and later
+        steps here force-detach ENIs and delete SGs/subnets/the VPC itself
+        regardless of whether a given instance survived termination, so a
+        per-instance skip alone would still leave a protected instance with
+        its networking torn out from under it. Skipping the whole VPC is the
+        only guarantee that a tagged resource is left completely untouched."""
+        try:
+            r = self.ec2.describe_instances(Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]},
+                {"Name": "instance-state-name",
+                 "Values": ["pending", "running", "stopping", "stopped"]},
+            ])
+            protected = [
+                i["InstanceId"]
+                for res in r["Reservations"] for i in res["Instances"]
+                if self._is_ignore_tag(i.get("Tags"))
+            ]
+            if protected:
+                return (f"protected EC2 instance(s) tagged "
+                        f"{CSP_IGNORE_KEY}={CSP_IGNORE_VALUE}: {protected}")
+        except Exception as exc:
+            return f"error checking {CSP_IGNORE_KEY} tag: {exc}"
+        return None
 
     def _vpc_list(self) -> list[str]:
         """Return [vpc_id] if specified, else all non-default VPCs in region.
@@ -1036,11 +1063,16 @@ class AWSCleaner(BaseCleaner):
             tgw_ids = []
             for tgw in tgws:
                 tags = {t["Key"]: t["Value"] for t in tgw.get("Tags", [])}
+                tid = tgw["TransitGatewayId"]
+                if self._is_ignore_tag(tgw.get("Tags")):
+                    details.append(
+                        f"skip TGW {tid}: protected by "
+                        f"{CSP_IGNORE_KEY}={CSP_IGNORE_VALUE} tag")
+                    continue
                 is_avx = any("aviatrix" in k.lower() or "aviatrix" in v.lower()
                              for k, v in tags.items())
                 if not is_avx:
                     continue
-                tid = tgw["TransitGatewayId"]
                 remaining = self.ec2.describe_transit_gateway_attachments(
                     Filters=[
                         {"Name": "transit-gateway-id", "Values": [tid]},
@@ -1139,6 +1171,12 @@ class AWSCleaner(BaseCleaner):
             return
         for vpc in vpcs:
             self.vpc_id = vpc
+            reason = self._vpc_protected_reason(vpc)
+            if reason:
+                update_job(self.table, self.job_id, "RUNNING",
+                           step_record(1, self.TOTAL, f"VPC {vpc} — protected, skipping",
+                                       "skipped", reason))
+                continue
             self.step1_eks()
             self.step2_asg()
             self.step3_ec2()

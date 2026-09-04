@@ -6,7 +6,7 @@ Uses google-auth + raw REST so no extra layer is needed.
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from .base import BaseCleaner
+from .base import BaseCleaner, CSP_IGNORE_KEY, CSP_IGNORE_VALUE
 
 
 class GCPCleaner(BaseCleaner):
@@ -130,8 +130,9 @@ class GCPCleaner(BaseCleaner):
             return [{"_list_error": str(exc)}]
 
     def _aggregated_instances_raw(self) -> list:
-        """Return all instances in self.region as (name, zone, network_name) tuples.
-        No server-side filter — GCP aggregated API ignores name: filters silently."""
+        """Return all instances in self.region as (name, zone, network_name,
+        labels) tuples. No server-side filter — GCP aggregated API ignores
+        name: filters silently."""
         try:
             data = self._get(
                 f"{self.BASE}/projects/{self.project}/aggregated/instances",
@@ -144,13 +145,14 @@ class GCPCleaner(BaseCleaner):
                 for inst in zone_data.get("instances", []):
                     nics = inst.get("networkInterfaces", [])
                     net = nics[0].get("network", "").rsplit("/", 1)[-1] if nics else ""
-                    out.append((inst["name"], zone, net))
+                    out.append((inst["name"], zone, net, inst.get("labels") or {}))
             return out
         except Exception as exc:
-            return [("_error", str(exc), "")]
+            return [("_error", str(exc), "", {})]
 
     def _aggregated_disks_raw(self) -> list:
-        """Return all disks in self.region as (name, zone) tuples. No server-side filter."""
+        """Return all disks in self.region as (name, zone, labels) tuples.
+        No server-side filter."""
         try:
             data = self._get(
                 f"{self.BASE}/projects/{self.project}/aggregated/disks",
@@ -161,10 +163,10 @@ class GCPCleaner(BaseCleaner):
                 if not zone.startswith(self.region):
                     continue
                 for disk in zone_data.get("disks", []):
-                    out.append((disk["name"], zone))
+                    out.append((disk["name"], zone, disk.get("labels") or {}))
             return out
         except Exception as exc:
-            return [("_error", str(exc))]
+            return [("_error", str(exc), {})]
 
     # ── Steps ─────────────────────────────────────────────────────────────────
 
@@ -177,6 +179,11 @@ class GCPCleaner(BaseCleaner):
             for c in data.get("clusters", []):
                 loc = c.get("location", "")
                 if not loc.startswith(self.region):
+                    continue
+                if self._is_ignore_tag(c.get("resourceLabels")):
+                    details.append(
+                        f"skipped: GKE cluster {c.get('name')} protected by "
+                        f"{CSP_IGNORE_KEY}={CSP_IGNORE_VALUE} label")
                     continue
                 if ("aviatrix" not in c.get("name", "").lower()
                         and self.AVX_LABEL not in (c.get("resourceLabels") or {})):
@@ -191,9 +198,14 @@ class GCPCleaner(BaseCleaner):
     def step2_instances(self, avx_nets: set):
         details = []
         to_delete = []
-        for iname, zone, net in self._aggregated_instances_raw():
+        for iname, zone, net, labels in self._aggregated_instances_raw():
             if iname == "_error":
                 details.append(f"error listing instances: {zone}")
+                continue
+            if self._is_ignore_tag(labels):
+                details.append(
+                    f"skipped: instance {iname} protected by "
+                    f"{CSP_IGNORE_KEY}={CSP_IGNORE_VALUE} label")
                 continue
             is_avx_name = self._is_avx(iname)
             in_avx_net  = net in avx_nets
@@ -206,12 +218,17 @@ class GCPCleaner(BaseCleaner):
         details.extend(self._delete_urls_parallel(to_delete))
         self._finalize(2, "Compute Instances", details)
 
-    def step3_disks(self, avx_nets: set):
+    def step3_disks(self, avx_nets: set, protected_names: set = frozenset()):
         details = []
         to_delete = []
-        for dname, zone in self._aggregated_disks_raw():
+        for dname, zone, labels in self._aggregated_disks_raw():
             if dname == "_error":
                 details.append(f"error listing disks: {zone}")
+                continue
+            if self._is_ignore_tag(labels) or dname in protected_names:
+                details.append(
+                    f"skipped: disk {dname} protected by "
+                    f"{CSP_IGNORE_KEY}={CSP_IGNORE_VALUE} label")
                 continue
             if not self._is_avx(dname):
                 continue
@@ -432,9 +449,26 @@ class GCPCleaner(BaseCleaner):
         avx_nets = self._avx_and_peer_networks()
         self._dbg(f"avx_nets discovered: {sorted(avx_nets)}")
 
+        # Any instance labeled csp-cost-ignore=yes protects its whole network:
+        # later steps (firewalls/subnets/the network itself) apply to every
+        # network in avx_nets with no further per-resource check, so a
+        # protected instance's network must never enter that set at all.
+        protected_nets = set()
+        protected_names = set()
+        for iname, zone, net, labels in self._aggregated_instances_raw():
+            if iname == "_error":
+                continue
+            if self._is_ignore_tag(labels):
+                protected_names.add(iname)
+                if net:
+                    protected_nets.add(net)
+        if protected_nets:
+            self._dbg(f"protected_nets (csp-cost-ignore=yes): {sorted(protected_nets)}")
+            avx_nets = avx_nets - protected_nets
+
         self.step1_gke()
         self.step2_instances(avx_nets)
-        self.step3_disks(avx_nets)
+        self.step3_disks(avx_nets, protected_names)
         self.step4_instance_groups(avx_nets)
         self.step5_forwarding_rules()
         self.step6_vpn_tunnels()

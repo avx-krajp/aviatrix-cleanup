@@ -57,12 +57,29 @@ Parameters:
     Description: >
       HMAC signing key for auth cookies. Generate with
       `openssl rand -hex 32`. Pass via --parameter-overrides on first deploy.
+  ClaudeCodeCredsSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Secrets Manager secret holding Claude Code's credentials as
+      JSON, used by Claude Code on the deploy runner. Either a direct API key
+      ({"ANTHROPIC_API_KEY": "sk-ant-..."}) or Bedrock-routed credentials
+      ({"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_BEARER_TOKEN_BEDROCK": "...",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL": "...", "BEDROCK_REGION": "..."}).
+      Leave blank to disable the Deploy feature.
+  DeployRunnerAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      AMI for the Deploy runner EC2 instance. Defaults to the latest Amazon
+      Linux 2023 image, resolved at deploy time via SSM.
 
 # ── Conditions ────────────────────────────────────────────────────────────────
 Conditions:
-  HasAzureSecret: !Not [!Equals [!Ref AzureSpSecretArn, ""]]
-  HasGcpSecret:   !Not [!Equals [!Ref GcpSaSecretArn,   ""]]
-  HasAzureLayer:  !Not [!Equals [!Ref AzureSdkLayerArn, ""]]
+  HasAzureSecret:      !Not [!Equals [!Ref AzureSpSecretArn,        ""]]
+  HasGcpSecret:        !Not [!Equals [!Ref GcpSaSecretArn,          ""]]
+  HasAzureLayer:       !Not [!Equals [!Ref AzureSdkLayerArn,        ""]]
+  HasClaudeCodeCreds:  !Not [!Equals [!Ref ClaudeCodeCredsSecretArn, ""]]
 
 # ══════════════════════════════════════════════════════════════════════════════
 Resources:
@@ -260,6 +277,9 @@ Resources:
           SCHEDULE_NAME:       !Sub "${ResourcePrefix}aviatrix-cleanup-stop-daily"
           AZURE_SP_SECRET_ARN: !Ref AzureSpSecretArn
           GCP_SA_SECRET_ARN:   !Ref GcpSaSecretArn
+          DEPLOY_RUNNER_INSTANCE_ID: !If [HasClaudeCodeCreds, !Ref DeployRunnerInstance, ""]
+          DEPLOY_ARTIFACTS_BUCKET:   !Ref DeployArtifactsBucket
+          CLAUDE_CODE_CREDS_SECRET_ARN: !Ref ClaudeCodeCredsSecretArn
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref CleanupJobsTable
@@ -302,6 +322,22 @@ Resources:
                 - ec2:StartInstances
                 - ec2:StopInstances
               Resource: "*"
+        - Statement:
+            # ── Deploy feature — dispatch to the runner via SSM, read its logs ──
+            - Effect: Allow
+              Action:
+                - ssm:SendCommand
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript"
+                - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${DeployRunnerInstance}"
+            - Effect: Allow
+              Action:
+                - ssm:GetCommandInvocation
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "${DeployArtifactsBucket.Arn}/*"
       Events:
         StartCleanup:
           Type: HttpApi
@@ -389,6 +425,22 @@ Resources:
             ApiId: !Ref CleanupApi
             Method: POST
             Path: /api/instances/stop-all
+            Auth:
+              Authorizer: CookieAuthorizer
+        StartDeploy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: POST
+            Path: /api/deploy
+            Auth:
+              Authorizer: CookieAuthorizer
+        GetDeployStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CleanupApi
+            Method: GET
+            Path: /api/deploy/status
             Auth:
               Authorizer: CookieAuthorizer
 
@@ -530,6 +582,234 @@ Resources:
                 - iam:RemoveRoleFromInstanceProfile
                 - iam:DeleteInstanceProfile
               Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/aws-spoke-ec2-ssm-profile"
+
+  # ── Deploy feature — free-text request -> Claude Code -> Terraform apply ───
+  # An isolated VPC + EC2 runner that a lab user can point at a plain-English
+  # request (e.g. "stand up a controller + copilot in us-west-2"); Claude Code
+  # on the runner interprets it and drives `terraform apply` against the
+  # official Aviatrix control-plane module. Every resource here is tagged
+  # csp-cost-ignore=yes so the cleanup tool itself never tears down its own
+  # runner — see lambda/cleaners/base.py CSP_IGNORE_KEY/CSP_IGNORE_VALUE.
+  DeployRunnerVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.99.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}aviatrix-cleanup-deploy-runner-vpc"
+        - Key: csp-cost-ignore
+          Value: "yes"
+
+  DeployRunnerSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DeployRunnerVpc
+      CidrBlock: 10.99.0.0/26
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}aviatrix-cleanup-deploy-runner-subnet"
+        - Key: csp-cost-ignore
+          Value: "yes"
+
+  DeployRunnerIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}aviatrix-cleanup-deploy-runner-igw"
+        - Key: csp-cost-ignore
+          Value: "yes"
+
+  DeployRunnerIgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref DeployRunnerVpc
+      InternetGatewayId: !Ref DeployRunnerIgw
+
+  DeployRunnerRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref DeployRunnerVpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}aviatrix-cleanup-deploy-runner-rt"
+        - Key: csp-cost-ignore
+          Value: "yes"
+
+  DeployRunnerRoute:
+    Type: AWS::EC2::Route
+    DependsOn: DeployRunnerIgwAttachment
+    Properties:
+      RouteTableId: !Ref DeployRunnerRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref DeployRunnerIgw
+
+  DeployRunnerSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DeployRunnerSubnet
+      RouteTableId: !Ref DeployRunnerRouteTable
+
+  DeployRunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Deploy runner - outbound only (SSM Agent connects out; no inbound needed)"
+      VpcId: !Ref DeployRunnerVpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}aviatrix-cleanup-deploy-runner-sg"
+        - Key: csp-cost-ignore
+          Value: "yes"
+
+  DeployRunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: aviatrix-deploy-terraform
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                  - elasticloadbalancing:*
+                  - autoscaling:Describe*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:ListInstanceProfilesForRole
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt DeployArtifactsBucket.Arn
+                  - !Sub "${DeployArtifactsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                Resource: "*"
+              - !If
+                - HasClaudeCodeCreds
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref ClaudeCodeCredsSecretArn
+                - !Ref AWS::NoValue
+
+  DeployRunnerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DeployRunnerRole
+
+  DeployRunnerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !Ref DeployRunnerAmiId
+      SubnetId: !Ref DeployRunnerSubnet
+      SecurityGroupIds:
+        - !Ref DeployRunnerSecurityGroup
+      IamInstanceProfile: !Ref DeployRunnerInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}aviatrix-cleanup-deploy-runner"
+        - Key: csp-cost-ignore
+          Value: "yes"
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -x
+          exec > /var/log/aviatrix-deploy-bootstrap.log 2>&1
+
+          # Swap — t2.micro only has 1 GB RAM, which is tight for Node/npm +
+          # Terraform + Claude Code running concurrently.
+          if [ ! -f /swapfile ]; then
+            fallocate -l 2G /swapfile
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+          fi
+
+          dnf install -y git jq nodejs npm unzip dnf-plugins-core
+
+          dnf config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
+          dnf install -y terraform
+
+          npm install -g @anthropic-ai/claude-code
+
+          # Claude Code refuses --dangerously-skip-permissions when running as
+          # root (SSM Run Command's default user), so jobs run as this
+          # unprivileged user instead.
+          id deployrunner 2>/dev/null || useradd -m -s /bin/bash deployrunner
+
+          mkdir -p /opt/aviatrix-deploy
+          chown -R deployrunner:deployrunner /opt/aviatrix-deploy
+          echo "bootstrap complete: $(date)" > /opt/aviatrix-deploy/BOOTSTRAP_OK
+
+  # ── Deploy feature — Terraform state + SSM session log mirror ──────────────
+  DeployArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}aviatrix-cleanup-deploy-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
 
   # ── Web bucket — private; only CloudFront can read ─────────────────────────
   WebBucket:
@@ -709,3 +989,11 @@ Outputs:
   DynamoTableName:
     Description: "DynamoDB job table"
     Value: !Ref CleanupJobsTable
+
+  DeployRunnerInstanceId:
+    Description: "Deploy feature — runner EC2 instance ID (SSM managed target)"
+    Value: !Ref DeployRunnerInstance
+
+  DeployArtifactsBucketName:
+    Description: "Deploy feature — Terraform state + session log bucket"
+    Value: !Ref DeployArtifactsBucket
